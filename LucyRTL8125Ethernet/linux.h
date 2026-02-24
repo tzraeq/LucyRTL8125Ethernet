@@ -227,13 +227,12 @@ _OSWriteInt8((base), (byteOffset), (data))
 #define OSReadLittleInt8(base, byteOffset) \
 _OSReadInt8((base), (byteOffset))
 
-#define RTL_W8(tp, reg, val8)      _OSWriteInt8(tp->mmio_addr, (reg), (val8))
-#define RTL_W16(tp, reg, val16)    OSWriteLittleInt16(tp->mmio_addr, (reg), (val16))
-#define RTL_W32(tp, reg, val32)    OSWriteLittleInt32(tp->mmio_addr, (reg), (val32))
-
-#define RTL_R8(tp, reg)             _OSReadInt8(tp->mmio_addr, (reg))
-#define RTL_R16(tp, reg)            OSReadLittleInt16(tp->mmio_addr, (reg))
-#define RTL_R32(tp, reg)            OSReadLittleInt32(tp->mmio_addr, (reg))
+#define RTL_W8(tp, reg, val8)   _OSWriteInt8((tp)->mmio_addr, (reg), (val8))
+#define RTL_W16(tp, reg, val16) OSWriteLittleInt16((tp)->mmio_addr, (reg), (val16))
+#define RTL_W32(tp, reg, val32) OSWriteLittleInt32((tp)->mmio_addr, (reg), (val32))
+#define RTL_R8(tp, reg)         _OSReadInt8((tp)->mmio_addr, (reg))
+#define RTL_R16(tp, reg)        OSReadLittleInt16((tp)->mmio_addr, (reg))
+#define RTL_R32(tp, reg)        OSReadLittleInt32((tp)->mmio_addr, (reg))
 
 #define wmb() OSSynchronizeIO()
 

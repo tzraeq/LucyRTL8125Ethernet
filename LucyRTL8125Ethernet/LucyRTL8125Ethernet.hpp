@@ -18,9 +18,8 @@
 * This driver is based on Realtek's r8125 Linux driver (9.003.04).
 */
 
-#include <IOKit/IODMACommand.h>
-
 #include "LucyRTL8125Linux-900501.hpp"
+#include "RTL8125LucyRxPool.hpp"
 
 #ifdef DEBUG
 #define DebugLog(args...) IOLog(args)
@@ -29,13 +28,6 @@
 #endif
 
 #define    RELEASE(x)    if(x){(x)->release();(x)=NULL;}
-
-#define WriteReg8(reg, val8)    _OSWriteInt8((baseAddr), (reg), (val8))
-#define WriteReg16(reg, val16)  OSWriteLittleInt16((baseAddr), (reg), (val16))
-#define WriteReg32(reg, val32)  OSWriteLittleInt32((baseAddr), (reg), (val32))
-#define ReadReg8(reg)           _OSReadInt8((baseAddr), (reg))
-#define ReadReg16(reg)          OSReadLittleInt16((baseAddr), (reg))
-#define ReadReg32(reg)          OSReadLittleInt32((baseAddr), (reg))
 
 #define super IOEthernetController
 
@@ -134,10 +126,16 @@ enum RtlStateMask {
 };
 
 /* RTL8125's Rx descriptor. */
-typedef struct RtlRxDesc {
-    UInt32 opts1;
-    UInt32 opts2;
-    UInt64 addr;
+typedef union RtlRxDesc {
+    struct {
+        UInt32 opts1;
+        UInt32 opts2;
+        UInt64 addr;
+    } cmd;
+    struct {
+        UInt64 blen;
+        UInt64 addr;
+    } buf;
 } RtlRxDesc;
 
 /* RTL8125's Tx descriptor. */
@@ -153,19 +151,46 @@ typedef struct RtlTxDesc {
 
 /* RTL8125's statistics dump data structure */
 typedef struct RtlStatData {
-    UInt64    txPackets;
-    UInt64    rxPackets;
-    UInt64    txErrors;
-    UInt32    rxErrors;
-    UInt16    rxMissed;
-    UInt16    alignErrors;
-    UInt32    txOneCollision;
-    UInt32    txMultiCollision;
-    UInt64    rxUnicast;
-    UInt64    rxBroadcast;
-    UInt32    rxMulticast;
-    UInt16    txAborted;
-    UInt16    txUnderun;
+    UInt64 txPackets;
+    UInt64 rxPackets;
+    UInt64 txErrors;
+    UInt32 rxErrors;
+    UInt16 rxMissed;
+    UInt16 alignErrors;
+    UInt32 txOneCollision;
+    UInt32 txMultiCollision;
+    UInt64 rxUnicast;
+    UInt64 rxBroadcast;
+    UInt32 rxMulticast;
+    UInt16 txAborted;
+    UInt16 txUnderun;
+    /* new since RTL8125 */
+    UInt64 txOctets;
+    UInt64 rxOctets;
+    UInt64 rxMulticast64;
+    UInt64 txUnicast64;
+    UInt64 txBroadcast64;
+    UInt64 txMulticast64;
+    UInt32 txPauseOn;
+    UInt32 txPauseOff;
+    UInt32 txPauseAll;
+    UInt32 txDeferred;
+    UInt32 txLateCollision;
+    UInt32 txAllCollision;
+    UInt32 txAborted32;
+    UInt32 alignErrors32;
+    UInt32 rxFrame2Long;
+    UInt32 rxRunt;
+    UInt32 rxPauseOn;
+    UInt32 rxPauseOff;
+    UInt32 rxPauseAll;
+    UInt32 rxUnknownOpcode;
+    UInt32 rxMacError;
+    UInt32 txUnderrun32;
+    UInt32 rxMacMissed;
+    UInt32 rxTcamDropped;
+    UInt32 tdu;
+    UInt32 rdu;
 } RtlStatData;
 
 #define kTransmitQueueCapacity  1024
@@ -181,20 +206,39 @@ typedef struct RtlStatData {
 #define kTxDescMask    (kNumTxDesc - 1)
 #define kRxDescMask    (kNumRxDesc - 1)
 #define kTxDescSize    (kNumTxDesc*sizeof(struct RtlTxDesc))
-#define kRxDescSize    (kNumRxDesc*sizeof(struct RtlRxDesc))
-#define kRxBufArraySize (kNumRxDesc * sizeof(mbuf_t))
+#define kRxDescSize    (kNumRxDesc*sizeof(union RtlRxDesc))
+#define kRxBufArraySize (kNumRxDesc * sizeof(struct rtlRxBufferInfo))
 #define kTxBufArraySize (kNumTxDesc * sizeof(mbuf_t))
 
+/* Numbers of IOMemoryDescriptors and IORanges for tx */
+#define kNumTxMemDesc       (kNumTxDesc / 2)
+#define kTxMemDescMask      (kNumTxMemDesc - 1)
+#define kNumTxRanges        (kNumTxDesc + kMaxSegs)
+#define kTxRangeMask        kTxDescMask
+#define kTxMapMemSize       sizeof(struct rtlTxMapInfo)
+
+/* Numbers of IOMemoryDescriptors and batch size for rx */
+#define kRxMemBaseShift 4
+#define kNumRxMemDesc   (kNumRxDesc >> kRxMemBaseShift)
+#define kRxMapMemSize   (sizeof(struct rtlRxMapInfo))
+#define kRxMemBatchSize (kNumRxDesc / kNumRxMemDesc)
+#define kRxMemDescMask  (kRxMemBatchSize - 1)
+#define kRxMemBaseMask  ~kRxMemDescMask
+
+
 /* This is the receive buffer size (must be large enough to hold a packet). */
-#define kRxBufferSize4K    4096
-#define kRxBufferSize9K    9020
-#define kRxNumSpareMbufs    150
+#define kRxBufferSize   PAGE_SIZE
+
 #define kMCFilterLimit  32
 #define kMaxMtu 9000
-#define kMaxPacketSize (kMaxMtu + ETH_HLEN + ETH_FCS_LEN)
+#define kMaxPacketSize (kMaxMtu + ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN)
 
-/* statitics timer period in ms. */
-#define kTimeoutMS 1000
+/* statitics dump delay in ns. */
+#define kStatDelayTime 1000000UL    /* 1ms */
+
+/* RealtekRxPool capacities */
+#define kRxPoolClstCap   100    /* mbufs with 4k cluster*/
+#define kRxPoolMbufCap   50     /* mbufs without clusters */
 
 /* Treshhold value to wake a stalled queue */
 #define kTxQueueWakeTreshhold (kNumTxDesc / 10)
@@ -202,6 +246,7 @@ typedef struct RtlStatData {
 /* transmitter deadlock treshhold in seconds. */
 #define kTxDeadlockTreshhold 6
 #define kTxCheckTreshhold (kTxDeadlockTreshhold - 1)
+#define kTimerPeriod    1000000000UL
 
 /* MSS value position */
 #define MSSShift_8125 18
@@ -250,6 +295,66 @@ enum
 #define kEnableRxPollName "rxPolling"
 
 extern const struct RTLChipInfo rtl_chip_info[];
+
+/*
+ * Indicates if a tx IOMemoryDescriptor is in the prepared
+ * (active) or completed state (inactive).
+ */
+enum
+{
+    kIOMemoryInactive = 0,
+    kIOMemoryActive = 1
+};
+
+typedef struct rtlTxMapInfo {
+    UInt16 txNextMem2Use;
+    UInt16 txNextMem2Free;
+    SInt16 txNumFreeMem;
+    IOMemoryDescriptor *txMemIO[kNumTxMemDesc];
+    IOAddressRange txMemRange[kNumTxRanges];
+    IOAddressRange txSCRange[kMaxSegs];
+} rtlTxMapInfo;
+
+typedef struct rtlRxMapInfo {
+    IOMemoryDescriptor *rxMemIO[kNumRxMemDesc];
+    IOAddressRange rxMemRange[kNumRxDesc];
+} rtlRxMapInfo;
+
+typedef struct rtlRxBufferInfo {
+    mbuf_t mbuf;
+    IOPhysicalAddress64 phyAddr;
+} rtlRxBufferInfo;
+
+
+
+/**
+ *  Known kernel versions
+ */
+enum KernelVersion {
+    Tiger         = 8,
+    Leopard       = 9,
+    SnowLeopard   = 10,
+    Lion          = 11,
+    MountainLion  = 12,
+    Mavericks     = 13,
+    Yosemite      = 14,
+    ElCapitan     = 15,
+    Sierra        = 16,
+    HighSierra    = 17,
+    Mojave        = 18,
+    Catalina      = 19,
+    BigSur        = 20,
+    Monterey      = 21,
+    Ventura       = 22,
+    Sonoma        = 23,
+    Sequoia       = 24,
+    Tahoe         = 25,
+};
+
+/**
+ *  Kernel version major
+ */
+extern const int version_major;
 
 class LucyRTL8125 : public super
 {
@@ -311,10 +416,9 @@ private:
     bool setupMediumDict();
     bool initEventSources(IOService *provider);
     
-    void interruptHandler(OSObject *client, IOInterruptEventSource *src, int count);
+    void interruptOccurred(OSObject *client, IOInterruptEventSource *src, int count);
     UInt32 rxInterrupt(IONetworkInterface *interface, uint32_t maxCount, IOMbufQueue *pollQueue, void *context);
     void txInterrupt();
-    void pciErrorInterrupt();
 
     bool setupRxResources();
     bool setupTxResources();
@@ -322,13 +426,12 @@ private:
     void freeRxResources();
     void freeTxResources();
     void freeStatResources();
-    void refillSpareBuffers();
     
     static IOReturn refillAction(OSObject *owner, void *arg1, void *arg2, void *arg3, void *arg4);
 
     void clearRxTxRings();
+    void discardPacketFragment();
     void checkLinkStatus();
-    void updateStatitics();
     void setLinkUp();
     void setLinkDown();
     bool txHangCheck();
@@ -336,6 +439,7 @@ private:
     /* Hardware initialization methods. */
     IOReturn identifyChip();
     bool initRTL8125();
+    void initMacAddr(struct rtl8125_private *tp);
     void enableRTL8125();
     void disableRTL8125();
     void setupRTL8125();
@@ -358,9 +462,26 @@ private:
     void configPhyHardware8125b1();
     void configPhyHardware8125b2();
 
+    void rtl812xDumpTallyCounter(struct rtl8125_private *tp);
+    static void runStatUpdateThread(thread_call_param_t param0);
+    void statUpdateThread();
+
     /* Descriptor related methods. */
-    inline void getChecksumResult(mbuf_t m, UInt32 status1, UInt32 status2);
+    void getChecksumResult(mbuf_t m, UInt32 status1, UInt32 status2);
     
+    /* AppleVTD support methods*/
+    bool setupRxMap();
+    void freeRxMap();
+    bool setupTxMap();
+    void freeTxMap();
+
+    void    interruptOccurredVTD(OSObject *client, IOInterruptEventSource *src, int count);
+    UInt32  rxInterruptVTD(IONetworkInterface *interface, uint32_t maxCount,
+                           IOMbufQueue *pollQueue, void *context);
+    UInt32  txMapPacket(mbuf_t packet, IOPhysicalSegment *vector, UInt32 maxSegs);
+    void    txUnmapPacket();
+    UInt16  rxMapBuffers(UInt16 index, UInt16 count);
+
     /* Watchdog timer method. */
     void timerActionRTL8125(IOTimerEventSource *timer);
 
@@ -377,7 +498,6 @@ private:
     IOEthernetInterface *netif;
     IOMemoryMap *baseMap;
     IOMapper *mapper;
-    volatile void *baseAddr;
     
     /* transmitter data */
     IOBufferMemoryDescriptor *txBufDesc;
@@ -387,6 +507,8 @@ private:
     IOMbufNaturalMemoryCursor *txMbufCursor;
     mbuf_t *txMbufArray;
     void *txBufArrayMem;
+    rtlTxMapInfo *txMapInfo;
+    void *txMapMem;
     UInt64 txDescDoneCount;
     UInt64 txDescDoneLast;
     UInt32 txNextDescIndex;
@@ -399,18 +521,20 @@ private:
     IOBufferMemoryDescriptor *rxBufDesc;
     IOPhysicalAddress64 rxPhyAddr;
     IODMACommand *rxDescDmaCmd;
-    struct RtlRxDesc *rxDescArray;
-    IOMbufNaturalMemoryCursor *rxMbufCursor;
-    mbuf_t *rxMbufArray;
+    RtlRxDesc *rxDescArray;
+    rtlRxBufferInfo *rxBufArray;
     void *rxBufArrayMem;
-    mbuf_t sparePktHead;
-    mbuf_t sparePktTail;
+    void *rxMapMem;
+    rtlRxMapInfo *rxMapInfo;
+    RTL8125LucyRxPool *rxPool;
     UInt64 multicastFilter;
-    UInt32 rxNextDescIndex;
-    UInt32 rxBufferSize;
+    mbuf_t rxPacketHead;
+    mbuf_t rxPacketTail;
     UInt32 rxConfigReg;
     UInt32 rxConfigMask;
-    SInt32 spareNum;
+    SInt32 rxPacketSize;
+    UInt16 rxNextDescIndex;
+    UInt16 rxMapNextIndex;
 
     /* power management data */
     unsigned long powerState;
@@ -424,6 +548,7 @@ private:
     IOBufferMemoryDescriptor *statBufDesc;
     IOPhysicalAddress64 statPhyAddr;
     IODMACommand *statDescDmaCmd;
+    thread_call_t statCall;
     struct RtlStatData *statData;
 
     UInt32 mtu;
@@ -445,17 +570,19 @@ private:
     UInt32 intrMaskTimer;
     UInt32 intrMaskPoll;
 
+    UInt64 statDelay;
+    UInt64 timerInterval;
+
     /* flags */
     UInt32 stateFlags;
     
-    bool needsUpdate;
     bool wolCapable;
     bool wolActive;
     bool enableTSO4;
     bool enableTSO6;
-    bool enableCSO6;
+    bool useAppleVTD;
     
-#ifdef DEBUG
+#ifdef DEBUG_INTR
     UInt32 tmrInterrupts;
     UInt32 lastRxIntrupts;
     UInt32 lastTxIntrupts;

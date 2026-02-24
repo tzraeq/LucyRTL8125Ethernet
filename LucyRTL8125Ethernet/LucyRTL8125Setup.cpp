@@ -29,16 +29,35 @@ static const char *offName = "disabled";
 void LucyRTL8125::getParams()
 {
     OSDictionary *params;
+    OSIterator *iterator;
     OSNumber *pollInt;
     OSBoolean *enableEEE;
     OSBoolean *tso4;
     OSBoolean *tso6;
-    OSBoolean *csoV6;
     OSBoolean *noASPM;
     OSString *versionString;
     OSString *fbAddr;
     UInt32 usInterval;
     
+    if (version_major >= Tahoe) {
+        params = serviceMatching("AppleVTD");
+        
+        if (params) {
+            iterator = IOService::getMatchingServices(params);
+            
+            if (iterator) {
+                IOMapper *mp = OSDynamicCast(IOMapper, iterator->getNextObject());
+                
+                if (mp) {
+                    IOLog("AppleVTD is enabled.");
+                    useAppleVTD = true;
+                }
+                iterator->release();
+            }
+            params->release();
+        }
+    }
+
     versionString = OSDynamicCast(OSString, getProperty(kDriverVersionName));
 
     params = OSDynamicCast(OSDictionary, getProperty(kParamName));
@@ -67,12 +86,7 @@ void LucyRTL8125::getParams()
         enableTSO6 = (tso6) ? tso6->getValue() : false;
         
         IOLog("TCP/IPv6 segmentation offload %s.\n", enableTSO6 ? onName : offName);
-        
-        csoV6 = OSDynamicCast(OSBoolean, params->getObject(kEnableCSO6Name));
-        enableCSO6 = (csoV6) ? csoV6->getValue() : false;
-        
-        IOLog("TCP/IPv6 checksum offload %s.\n", enableCSO6 ? onName : offName);
-        
+                
         pollInt = OSDynamicCast(OSNumber, params->getObject(kPollInt2500Name));
 
         if (pollInt) {
@@ -215,7 +229,11 @@ bool LucyRTL8125::initEventSources(IOService *provider)
     if (msiIndex != -1) {
         DebugLog("MSI interrupt index: %d\n", msiIndex);
         
-        interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &LucyRTL8125::interruptHandler), provider, msiIndex);
+        if (useAppleVTD) {
+            interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &LucyRTL8125::interruptOccurredVTD), provider, msiIndex);
+        } else {
+            interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &LucyRTL8125::interruptOccurred), provider, msiIndex);
+        }
     }
     if (!interruptSource) {
         IOLog("Error: MSI index was not found or MSI interrupt could not be enabled.\n");
@@ -249,13 +267,13 @@ error1:
 
 bool LucyRTL8125::setupRxResources()
 {
-    IOPhysicalSegment rxSegment;
+    IOPhysicalAddress64 pa = 0;
     IODMACommand::Segment64 seg;
     mbuf_t m;
     UInt64 offset = 0;
+    UInt64 word1;
     UInt32 numSegs = 1;
     UInt32 i;
-    UInt32 opts1;
     bool result = false;
     
     /* Alloc rx mbuf_t array. */
@@ -265,7 +283,7 @@ bool LucyRTL8125::setupRxResources()
         IOLog("Couldn't alloc receive buffer array.\n");
         goto done;
     }
-    rxMbufArray = (mbuf_t *)rxBufArrayMem;
+    rxBufArray = (rtlRxBufferInfo *)rxBufArrayMem;
 
     /* Create receiver descriptor array. */
     rxBufDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryHostPhysicallyContiguous | kIOMapInhibitCache), kRxDescSize, 0xFFFFFFFFFFFFFF00ULL);
@@ -301,74 +319,58 @@ bool LucyRTL8125::setupRxResources()
     
     /* Initialize rxDescArray. */
     bzero(rxDescArray, kRxDescSize);
-    rxDescArray[kRxLastDesc].opts1 = OSSwapHostToLittleInt32(RingEnd);
+    rxDescArray[kRxLastDesc].cmd.opts1 = OSSwapHostToLittleInt32(RingEnd);
 
-    for (i = 0; i < kNumRxDesc; i++) {
-        rxMbufArray[i] = NULL;
-    }
     rxNextDescIndex = 0;
-    
-    rxMbufCursor = IOMbufNaturalMemoryCursor::withSpecification(PAGE_SIZE, 1);
-    
-    if (!rxMbufCursor) {
-        IOLog("Couldn't create rxMbufCursor.\n");
+    rxMapNextIndex = 0;
+
+    rxPool = RTL8125LucyRxPool::withCapacity(kRxPoolMbufCap, kRxPoolClstCap);
+
+    if (!rxPool) {
+        IOLog("Couldn't alloc receive buffer pool.\n");
         goto error_segm;
     }
 
     /* Alloc receive buffers. */
     for (i = 0; i < kNumRxDesc; i++) {
-        m = allocatePacket(rxBufferSize);
-        
-        if (!m) {
-            IOLog("Couldn't alloc receive buffer.\n");
-            goto error_buf;
-        }
-        rxMbufArray[i] = m;
-        
-        if (rxMbufCursor->getPhysicalSegments(m, &rxSegment, 1) != 1) {
-            IOLog("getPhysicalSegments() for receive buffer failed.\n");
-            goto error_buf;
-        }
-        opts1 = (UInt32)rxSegment.length;
-        opts1 |= (i == kRxLastDesc) ? (RingEnd | DescOwn) : DescOwn;
-        rxDescArray[i].opts1 = OSSwapHostToLittleInt32(opts1);
-        rxDescArray[i].opts2 = 0;
-        rxDescArray[i].addr = OSSwapHostToLittleInt64(rxSegment.location);
-    }
-    /*
-     * Allocate some spare mbufs and keep them in a buffer pool, to
-     * have them at hand in case replaceOrCopyPacket() fails
-     * under heavy load.
-     */
-    sparePktHead = sparePktTail = NULL;
+        m = rxPool->getPacket(kRxBufferSize, MBUF_WAITOK);
 
-    for (i = 0; i < kRxNumSpareMbufs; i++) {
-        m = allocatePacket(rxBufferSize);
-        
-        if (m) {
-            if (sparePktHead) {
-                mbuf_setnext(sparePktTail, m);
-                sparePktTail = m;
-                spareNum++;
-            } else {
-                sparePktHead = sparePktTail = m;
-                spareNum = 1;
-            }
+        if (!m) {
+            IOLog("Couldn't get receive buffer from pool.\n");
+            goto error_buf;
+        }
+        rxBufArray[i].mbuf = m;
+
+        if (!useAppleVTD) {
+            word1 = (kRxBufferSize | DescOwn);
+
+            if (i == kRxLastDesc)
+                word1 |= RingEnd;
+
+            pa = mbuf_data_to_physical(mbuf_datastart(m));
+            rxBufArray[i].phyAddr = pa;
+
+            rxDescArray[i].buf.blen = OSSwapHostToLittleInt64(word1);
+            rxDescArray[i].buf.addr = OSSwapHostToLittleInt64(pa);
         }
     }
-    result = true;
-    
+    if (useAppleVTD)
+        result = setupRxMap();
+    else
+        result = true;
+
 done:
     return result;
     
 error_buf:
     for (i = 0; i < kNumRxDesc; i++) {
-        if (rxMbufArray[i]) {
-            freePacket(rxMbufArray[i]);
-            rxMbufArray[i] = NULL;
+        if (rxBufArray[i].mbuf) {
+            mbuf_freem_list(rxBufArray[i].mbuf);
+            rxBufArray[i].mbuf = NULL;
+            rxBufArray[i].phyAddr = 0;
         }
     }
-    RELEASE(rxMbufCursor);
+    RELEASE(rxPool);
 
 error_segm:
     rxDescDmaCmd->clearMemoryDescriptor();
@@ -385,35 +387,9 @@ error_prep:
 error_buff:
     IOFree(rxBufArrayMem, kRxBufArraySize);
     rxBufArrayMem = NULL;
-    rxMbufArray = NULL;
+    rxBufArray = NULL;
 
     goto done;
-}
-
-void LucyRTL8125::refillSpareBuffers()
-{
-    mbuf_t m;
-
-    while (spareNum < kRxNumSpareMbufs) {
-        m = allocatePacket(rxBufferSize);
-
-        if (!m)
-            break;
-        
-        mbuf_setnext(sparePktTail, m);
-        sparePktTail = m;
-        OSIncrementAtomic(&spareNum);
-    }
-}
-
-IOReturn LucyRTL8125::refillAction(OSObject *owner, void *arg1, void *arg2, void *arg3, void *arg4)
-{
-    LucyRTL8125 *ethCtlr = OSDynamicCast(LucyRTL8125, owner);
-    
-    if (ethCtlr) {
-        ethCtlr->refillSpareBuffers();
-    }
-    return kIOReturnSuccess;
 }
 
 bool LucyRTL8125::setupTxResources()
@@ -421,7 +397,6 @@ bool LucyRTL8125::setupTxResources()
     IODMACommand::Segment64 seg;
     UInt64 offset = 0;
     UInt32 numSegs = 1;
-    UInt32 i;
     bool result = false;
     
     /* Alloc tx mbuf_t array. */
@@ -469,20 +444,25 @@ bool LucyRTL8125::setupTxResources()
     bzero(txDescArray, kTxDescSize);
     txDescArray[kTxLastDesc].opts1 = OSSwapHostToLittleInt32(RingEnd);
     
-    for (i = 0; i < kNumTxDesc; i++) {
-        txMbufArray[i] = NULL;
-    }
     txNextDescIndex = txDirtyDescIndex = 0;
-    txTailPtr0 = txClosePtr0 = 0;
     txNumFreeDesc = kNumTxDesc;
-    txMbufCursor = IOMbufNaturalMemoryCursor::withSpecification(0x1000, kMaxSegs);
-    
-    if (!txMbufCursor) {
-        IOLog("Couldn't create txMbufCursor.\n");
-        goto error_segm;
+    txTailPtr0 = txClosePtr0 = 0;
+
+    if (useAppleVTD) {
+        result = setupTxMap();
+        
+        if (!result)
+            goto error_segm;
+    } else {
+        txMbufCursor = IOMbufNaturalMemoryCursor::withSpecification(PAGE_SIZE, kMaxSegs);
+        
+        if (!txMbufCursor) {
+            IOLog("Couldn't create txMbufCursor.\n");
+            goto error_segm;
+        }
+        result = true;
     }
-    result = true;
-    
+
 done:
     return result;
     
@@ -513,12 +493,19 @@ bool LucyRTL8125::setupStatResources()
     UInt32 numSegs = 1;
     bool result = false;
 
+    statCall = thread_call_allocate_with_options((thread_call_func_t) &runStatUpdateThread, (void *) this, THREAD_CALL_PRIORITY_KERNEL, 0);
+    
+    if (!statCall) {
+        IOLog("Couldn't alloc thread_call.\n");
+        goto done;
+    }
+
     /* Create statistics dump buffer. */
     statBufDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (kIODirectionIn | kIOMemoryPhysicallyContiguous | kIOMemoryHostPhysicallyContiguous | kIOMapInhibitCache), sizeof(RtlStatData), 0xFFFFFFFFFFFFFF00ULL);
     
     if (!statBufDesc) {
         IOLog("Couldn't alloc statBufDesc.\n");
-        goto done;
+        goto error_mem;
     }
     
     if (statBufDesc->prepare() != kIOReturnSuccess) {
@@ -565,6 +552,9 @@ error_dma:
 
 error_prep:
     RELEASE(statBufDesc);
+    
+error_mem:
+    thread_call_free(statCall);
     goto done;
 }
 
@@ -572,39 +562,43 @@ void LucyRTL8125::freeRxResources()
 {
     UInt32 i;
         
+    if (useAppleVTD)
+        freeRxMap();
+
+    if (rxDescDmaCmd) {
+        rxDescDmaCmd->complete();
+        rxDescDmaCmd->clearMemoryDescriptor();
+        rxDescDmaCmd->release();
+        rxDescDmaCmd = NULL;
+    }
     if (rxBufDesc) {
         rxBufDesc->complete();
         rxBufDesc->release();
         rxBufDesc = NULL;
         rxPhyAddr = (IOPhysicalAddress64)NULL;
     }
-    RELEASE(rxMbufCursor);
+    RELEASE(rxPool);
     
-    for (i = 0; i < kNumRxDesc; i++) {
-        if (rxMbufArray[i]) {
-            freePacket(rxMbufArray[i]);
-            rxMbufArray[i] = NULL;
-        }
-    }
-    if (rxDescDmaCmd) {
-        rxDescDmaCmd->clearMemoryDescriptor();
-        rxDescDmaCmd->release();
-        rxDescDmaCmd = NULL;
-    }
     if (rxBufArrayMem) {
+        for (i = 0; i < kNumRxDesc; i++) {
+            if (rxBufArray[i].mbuf) {
+                mbuf_freem_list(rxBufArray[i].mbuf);
+                rxBufArray[i].mbuf = NULL;
+            }
+        }
         IOFree(rxBufArrayMem, kRxBufArraySize);
         rxBufArrayMem = NULL;
-        rxMbufArray = NULL;
-    }
-    if (sparePktHead) {
-        mbuf_freem(sparePktHead);
-        sparePktHead = sparePktTail = NULL;
-        spareNum = 0;
+        rxBufArray = NULL;
     }
 }
 
 void LucyRTL8125::freeTxResources()
 {
+    if (useAppleVTD)
+        freeTxMap();
+    else
+        RELEASE(txMbufCursor);
+
     if (txBufDesc) {
         txBufDesc->complete();
         txBufDesc->release();
@@ -621,16 +615,21 @@ void LucyRTL8125::freeTxResources()
         txBufArrayMem = NULL;
         txMbufArray = NULL;
     }
-    RELEASE(txMbufCursor);
 }
 
 void LucyRTL8125::freeStatResources()
 {
+    if (statCall) {
+        thread_call_cancel(statCall);
+        IOSleep(2);
+        thread_call_free(statCall);
+        statCall = NULL;
+    }
     if (statBufDesc) {
         statBufDesc->complete();
         statBufDesc->release();
         statBufDesc = NULL;
-        statPhyAddr = (IOPhysicalAddress64)NULL;
+        statPhyAddr = 0;
     }
     if (statDescDmaCmd) {
         statDescDmaCmd->clearMemoryDescriptor();
@@ -641,15 +640,27 @@ void LucyRTL8125::freeStatResources()
 
 void LucyRTL8125::clearRxTxRings()
 {
+    IOMemoryDescriptor *md;
     mbuf_t m;
-    UInt32 lastIndex = kTxLastDesc;
-    UInt32 opts1;
+    UInt64 word1;
     UInt32 i;
     
-    DebugLog("clearDescriptors() ===>\n");
+    DebugLog("clearRxTxRings() ===>\n");
     
+    if (useAppleVTD && txMapInfo) {
+        for (i = 0; i < kNumTxMemDesc; i++) {
+            md = txMapInfo->txMemIO[i];
+            
+            if (md && (md->getTag() == kIOMemoryActive)) {
+                md->complete();
+                md->setTag(kIOMemoryInactive);
+            }
+        }
+        txMapInfo->txNextMem2Use = txMapInfo->txNextMem2Free = 0;
+        txMapInfo->txNumFreeMem = kNumTxMemDesc;
+    }
     for (i = 0; i < kNumTxDesc; i++) {
-        txDescArray[i].opts1 = OSSwapHostToLittleInt32((i != lastIndex) ? 0 : RingEnd);
+        txDescArray[i].opts1 = OSSwapHostToLittleInt32((i != kTxLastDesc) ? 0 : RingEnd);
         m = txMbufArray[i];
         
         if (m) {
@@ -658,19 +669,41 @@ void LucyRTL8125::clearRxTxRings()
         }
     }
     txTailPtr0 = txClosePtr0 = 0;
+
     txDirtyDescIndex = txNextDescIndex = 0;
     txNumFreeDesc = kNumTxDesc;
-    
-    lastIndex = kRxLastDesc;
-    
+        
+    if (useAppleVTD)
+        rxMapBuffers(0, kNumRxMemDesc);
+
     for (i = 0; i < kNumRxDesc; i++) {
-        opts1 = rxBufferSize;
-        opts1 |= (i == kRxLastDesc) ? (RingEnd | DescOwn) : DescOwn;
-        rxDescArray[i].opts1 = OSSwapHostToLittleInt32(opts1);
-        rxDescArray[i].opts2 = 0;
+        word1 = (kRxBufferSize | DescOwn);
+        
+        if (i == kRxLastDesc)
+            word1 |= RingEnd;
+        
+        rxDescArray[i].buf.blen = OSSwapHostToLittleInt64(word1);
+        rxDescArray[i].buf.addr = OSSwapHostToLittleInt64(rxBufArray[i].phyAddr);
     }
     rxNextDescIndex = 0;
+    rxMapNextIndex = 0;
     deadlockWarn = 0;
+
+    /* Free packet fragments which haven't been upstreamed yet.  */
+    discardPacketFragment();
+
+    DebugLog("clearRxTxRings() <===\n");
+}
+
+void LucyRTL8125::discardPacketFragment()
+{
+    /*
+     * In case there is a packet fragment which hasn't been enqueued yet
+     * we have to free it in order to prevent a memory leak.
+     */
+    if (rxPacketHead)
+        mbuf_freem_list(rxPacketHead);
     
-    DebugLog("clearDescriptors() <===\n");
+    rxPacketHead = rxPacketTail = NULL;
+    rxPacketSize = 0;
 }

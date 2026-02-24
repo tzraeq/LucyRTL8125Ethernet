@@ -21,6 +21,7 @@ extern "C" {
 #include <libkern/libkern.h>
 #include <libkern/version.h>
 #include <libkern/OSAtomic.h>
+#include <libkern/crypto/rand.h>
 #include <machine/limits.h>
 #include <net/ethernet.h>
 #include <sys/socket.h>
@@ -49,6 +50,7 @@ typedef u_int32_t ifnet_ctl_cmd_t;
 
 #include <IOKit/network/IOMbufMemoryCursor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IODMACommand.h>
 #include <IOKit/IOCommandGate.h>
 #include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOLib.h>
@@ -64,5 +66,6 @@ typedef u_int32_t ifnet_ctl_cmd_t;
 
 #endif // __cplusplus
 
+//#define DEBUG_INTR
 
 #endif /* LucyRTL8125Ethernet_Prefix_pch */

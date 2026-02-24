@@ -68,9 +68,9 @@ bool LucyRTL8125::initPCIConfigSpace(IOPCIDevice *provider)
         }
     }
     /* Enable the device. */
-    cmdReg    = provider->configRead16(kIOPCIConfigCommand);
-    cmdReg  &= ~kIOPCICommandIOSpace;
-    cmdReg    |= (kIOPCICommandBusMaster | kIOPCICommandMemorySpace | kIOPCICommandMemWrInvalidate);
+    cmdReg = provider->configRead16(kIOPCIConfigCommand);
+    cmdReg &= ~kIOPCICommandIOSpace;
+    cmdReg |= (kIOPCICommandBusMaster | kIOPCICommandMemorySpace | kIOPCICommandMemWrInvalidate);
     provider->configWrite16(kIOPCIConfigCommand, cmdReg);
     //provider->configWrite8(kIOPCIConfigLatencyTimer, 0x40);
     
@@ -80,8 +80,8 @@ bool LucyRTL8125::initPCIConfigSpace(IOPCIDevice *provider)
         IOLog("region #2 not an MMIO resource, aborting.\n");
         goto done;
     }
-    baseAddr = reinterpret_cast<volatile void *>(baseMap->getVirtualAddress());
-    linuxData.mmio_addr = baseAddr;
+    linuxData.mmio_addr = reinterpret_cast<volatile void *>(baseMap->getVirtualAddress());
+
     result = true;
     
 done:
@@ -146,7 +146,7 @@ IOReturn LucyRTL8125::identifyChip()
     UInt32 reg, val32;
     UInt32 version;
 
-    val32 = ReadReg32(TxConfig);
+    val32 = RTL_R32(tp, TxConfig);
     reg = val32 & 0x7c800000;
     version = val32 & 0x00700000;
 
@@ -189,6 +189,51 @@ IOReturn LucyRTL8125::identifyChip()
             break;
     }
     return result;
+}
+
+void LucyRTL8125::initMacAddr(struct rtl8125_private *tp)
+{
+    struct IOEthernetAddress macAddr;
+    int i;
+    
+    for (i = 0; i < kIOEthernetAddressSize; i++)
+        macAddr.bytes[i] = RTL_R8(tp, MAC0 + i);
+
+    DebugLog("Current MAC: %2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x\n",
+             macAddr.bytes[0], macAddr.bytes[1],
+             macAddr.bytes[2], macAddr.bytes[3],
+             macAddr.bytes[4], macAddr.bytes[5]);
+
+    *(u32*)&origMacAddr.bytes[0] = RTL_R32(tp, BACKUP_ADDR0_8125);
+    *(u16*)&origMacAddr.bytes[4] = RTL_R16(tp, BACKUP_ADDR1_8125);
+    
+    DebugLog("Backup MAC: %2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x\n",
+          origMacAddr.bytes[0], origMacAddr.bytes[1],
+          origMacAddr.bytes[2], origMacAddr.bytes[3],
+          origMacAddr.bytes[4], origMacAddr.bytes[5]);
+
+    if (is_valid_ether_addr((UInt8 *)&macAddr.bytes))
+        goto done;
+
+    if (is_valid_ether_addr((UInt8 *)&fallBackMacAddr.bytes)) {
+        memcpy(&macAddr.bytes, &fallBackMacAddr.bytes, sizeof(struct IOEthernetAddress));
+        goto done;
+    }
+    if (is_valid_ether_addr((UInt8 *)&origMacAddr.bytes)) {
+        memcpy(&macAddr.bytes, &origMacAddr.bytes, sizeof(struct IOEthernetAddress));
+        goto done;
+    }
+    /* Create a random Ethernet address. */
+    random_buf(&macAddr.bytes, kIOEthernetAddressSize);
+    macAddr.bytes[0] &= 0xfe;   /* clear multicast bit */
+    macAddr.bytes[0] |= 0x02;   /* set local assignment bit (IEEE802) */
+    DebugLog("Using random MAC address.\n");
+    
+done:
+    //memcpy(&origMacAddr.bytes, &macAddr.bytes, sizeof(struct IOEthernetAddress));
+    memcpy(&currMacAddr.bytes, &macAddr.bytes, sizeof(struct IOEthernetAddress));
+
+    rtl8125_rar_set(&linuxData, (UInt8 *)&currMacAddr.bytes);
 }
 
 bool LucyRTL8125::initRTL8125()
@@ -430,7 +475,7 @@ bool LucyRTL8125::initRTL8125()
             break;
     }
 
-    tp->NicCustLedValue = ReadReg16(CustomLED);
+    tp->NicCustLedValue = RTL_R16(tp, CustomLED);
 
     tp->wol_opts = rtl8125_get_hw_wol(tp);
     tp->wol_enabled = (tp->wol_opts) ? WOL_ENABLED : WOL_DISABLED;
@@ -452,14 +497,14 @@ bool LucyRTL8125::initRTL8125()
             rtl8125_set_eeprom_sel_low(tp);
 
     for (i = 0; i < MAC_ADDR_LEN; i++)
-            macAddr[i] = ReadReg8(MAC0 + i);
+            macAddr[i] = RTL_R8(tp, MAC0 + i);
 
     if(tp->mcfg == CFG_METHOD_2 ||
         tp->mcfg == CFG_METHOD_3 ||
         tp->mcfg == CFG_METHOD_4 ||
         tp->mcfg == CFG_METHOD_5) {
-            *(UInt32*)&macAddr[0] = ReadReg32(BACKUP_ADDR0_8125);
-            *(UInt16*)&macAddr[4] = ReadReg16(BACKUP_ADDR1_8125);
+            *(UInt32*)&macAddr[0] = RTL_R32(tp, BACKUP_ADDR0_8125);
+            *(UInt16*)&macAddr[4] = RTL_R16(tp, BACKUP_ADDR1_8125);
     }
 
     if (is_valid_ether_addr((UInt8 *) macAddr)) {
@@ -469,7 +514,7 @@ bool LucyRTL8125::initRTL8125()
         rtl8125_rar_set(tp, fallBackMacAddr.bytes);
     }
     for (i = 0; i < MAC_ADDR_LEN; i++) {
-        currMacAddr.bytes[i] = ReadReg8(MAC0 + i);
+        currMacAddr.bytes[i] = RTL_R8(tp, MAC0 + i);
         origMacAddr.bytes[i] = currMacAddr.bytes[i]; /* keep the original MAC address */
     }
     IOLog("%s: (Chipset %d), %2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x\n",
@@ -478,7 +523,7 @@ bool LucyRTL8125::initRTL8125()
           origMacAddr.bytes[2], origMacAddr.bytes[3],
           origMacAddr.bytes[4], origMacAddr.bytes[5]);
     
-    tp->cp_cmd = (ReadReg16(CPlusCmd) | RxChkSum);
+    tp->cp_cmd = (RTL_R16(tp, CPlusCmd) | RxChkSum);
     
     intrMaskRxTx = (SYSErr | LinkChg | RxDescUnavail | TxOK | RxOK);
     intrMaskTimer = (SYSErr | LinkChg | RxDescUnavail | PCSTimeout | RxOK);
@@ -490,8 +535,8 @@ bool LucyRTL8125::initRTL8125()
     rxConfigMask = rtl_chip_info[tp->chipset].RxConfigMask;
   
     /* Reset the tally counter. */
-    WriteReg32(CounterAddrHigh, (statPhyAddr >> 32));
-    WriteReg32(CounterAddrLow, (statPhyAddr & 0x00000000ffffffff) | CounterReset);
+    RTL_W32(tp, CounterAddrHigh, (statPhyAddr >> 32));
+    RTL_W32(tp, CounterAddrLow, (statPhyAddr & 0x00000000ffffffff) | CounterReset);
 
     rtl8125_disable_rxdvgate(tp);
     
@@ -533,8 +578,8 @@ void LucyRTL8125::disableRTL8125()
     struct rtl8125_private *tp = &linuxData;
     
     /* Disable all interrupts by clearing the interrupt mask. */
-    WriteReg32(IMR0_8125, 0);
-    WriteReg16(IntrStatus, ReadReg16(IntrStatus));
+    RTL_W32(tp, IMR0_8125, 0);
+    RTL_W16(tp, IntrStatus, RTL_R16(tp, IntrStatus));
 
     rtl8125_nic_reset(tp);
     hardwareD3Para();
@@ -578,20 +623,20 @@ void LucyRTL8125::setupRTL8125()
     UInt32 i;
     UInt16 mac_ocp_data;
     
-    WriteReg32(RxConfig, (RX_DMA_BURST << RxCfgDMAShift));
+    RTL_W32(tp, RxConfig, (RX_DMA_BURST << RxCfgDMAShift));
     
     rtl8125_nic_reset(tp);
     
-    WriteReg8(Cfg9346, ReadReg8(Cfg9346) | Cfg9346_Unlock);
+    RTL_W8(tp, Cfg9346, RTL_R8(tp, Cfg9346) | Cfg9346_Unlock);
     
     switch (tp->mcfg) {
         case CFG_METHOD_2:
         case CFG_METHOD_3:
         case CFG_METHOD_4:
         case CFG_METHOD_5:
-            WriteReg8(0xF1, ReadReg8(0xF1) & ~BIT_7);
-            WriteReg8(Config2, ReadReg8(Config2) & ~BIT_7);
-            WriteReg8(Config5, ReadReg8(Config5) & ~BIT_0);
+            RTL_W8(tp, 0xF1, RTL_R8(tp, 0xF1) & ~BIT_7);
+            RTL_W8(tp, Config2, RTL_R8(tp, Config2) & ~BIT_7);
+            RTL_W8(tp, Config5, RTL_R8(tp, Config5) & ~BIT_0);
             break;
     }
 
@@ -601,7 +646,7 @@ void LucyRTL8125::setupRTL8125()
         case CFG_METHOD_3:
         case CFG_METHOD_4:
         case CFG_METHOD_5:
-            WriteReg8(Config3, ReadReg8(Config3) & ~BIT_1);
+            RTL_W8(tp, Config3, RTL_R8(tp, Config3) & ~BIT_1);
             break;
     }
 
@@ -612,7 +657,7 @@ void LucyRTL8125::setupRTL8125()
         case CFG_METHOD_5:
             //IntMITI_0-IntMITI_31
             for (i=0xA00; i<0xB00; i+=4)
-                    WriteReg32(i, 0x00000000);
+                    RTL_W32(tp, i, 0x00000000);
             break;
     }
 
@@ -628,8 +673,8 @@ void LucyRTL8125::setupRTL8125()
             break;
     }
     /* Fill tally counter address. */
-    WriteReg32(CounterAddrHigh, (statPhyAddr >> 32));
-    WriteReg32(CounterAddrLow, (statPhyAddr & 0x00000000ffffffff));
+    RTL_W32(tp, CounterAddrHigh, (statPhyAddr >> 32));
+    RTL_W32(tp, CounterAddrLow, (statPhyAddr & 0x00000000ffffffff));
 
     /* Setup the descriptor rings. */
     txTailPtr0 = txClosePtr0 = 0;
@@ -637,17 +682,17 @@ void LucyRTL8125::setupRTL8125()
     txNumFreeDesc = kNumTxDesc;
     rxNextDescIndex = 0;
     
-    WriteReg32(TxDescStartAddrLow, (txPhyAddr & 0x00000000ffffffff));
-    WriteReg32(TxDescStartAddrHigh, (txPhyAddr >> 32));
-    WriteReg32(RxDescAddrLow, (rxPhyAddr & 0x00000000ffffffff));
-    WriteReg32(RxDescAddrHigh, (rxPhyAddr >> 32));
+    RTL_W32(tp, TxDescStartAddrLow, (txPhyAddr & 0x00000000ffffffff));
+    RTL_W32(tp, TxDescStartAddrHigh, (txPhyAddr >> 32));
+    RTL_W32(tp, RxDescAddrLow, (rxPhyAddr & 0x00000000ffffffff));
+    RTL_W32(tp, RxDescAddrHigh, (rxPhyAddr >> 32));
 
     /* Set DMA burst size and Interframe Gap Time */
-    WriteReg32(TxConfig, (TX_DMA_BURST_unlimited << TxDMAShift) |
+    RTL_W32(tp, TxConfig, (TX_DMA_BURST_unlimited << TxDMAShift) |
             (InterFrameGap << TxInterFrameGapShift));
 
     if (tp->EnableTxNoClose)
-            WriteReg32(TxConfig, (ReadReg32(TxConfig) | BIT_6));
+            RTL_W32(tp, TxConfig, (RTL_R32(tp, TxConfig) | BIT_6));
     
     if (tp->mcfg == CFG_METHOD_2 ||
         tp->mcfg == CFG_METHOD_3 ||
@@ -656,13 +701,13 @@ void LucyRTL8125::setupRTL8125()
         set_offset70F(tp, 0x27);
         setOffset79(0x50);
 
-        WriteReg16(0x382, 0x221B);
+        RTL_W16(tp, 0x382, 0x221B);
 
         /* Disable RSS. */
-        WriteReg8(RSS_CTRL_8125, 0x00);
-        WriteReg16(Q_NUM_CTRL_8125, 0x0000);
+        RTL_W8(tp, RSS_CTRL_8125, 0x00);
+        RTL_W16(tp, Q_NUM_CTRL_8125, 0x0000);
 
-        WriteReg8(Config1, ReadReg8(Config1) & ~0x10);
+        RTL_W8(tp, Config1, RTL_R8(tp, Config1) & ~0x10);
 
         rtl8125_mac_ocp_write(tp, 0xC140, 0xFFFF);
         rtl8125_mac_ocp_write(tp, 0xC142, 0xFFFF);
@@ -729,9 +774,9 @@ void LucyRTL8125::setupRTL8125()
         mac_ocp_data |= (BIT_4 | BIT_5);
         rtl8125_mac_ocp_write(tp, 0xE056, mac_ocp_data);
         
-        WriteReg8(TDFNR, 0x10);
+        RTL_W8(tp, TDFNR, 0x10);
         
-        WriteReg8(0xD0, RTL_R8(tp, 0xD0) | BIT_7);
+        RTL_W8(tp, 0xD0, RTL_R8(tp, 0xD0) | BIT_7);
         
         mac_ocp_data = rtl8125_mac_ocp_read(tp, 0xE040);
         mac_ocp_data &= ~(BIT_12);
@@ -756,10 +801,10 @@ void LucyRTL8125::setupRTL8125()
         rtl8125_mac_ocp_write(tp, 0xD430, mac_ocp_data);
         
         //rtl8125_mac_ocp_write(tp, 0xE0C0, 0x4F87);
-        WriteReg8(0xD0, RTL_R8(tp, 0xD0) | BIT_6 | BIT_7);
+        RTL_W8(tp, 0xD0, RTL_R8(tp, 0xD0) | BIT_6 | BIT_7);
         
         if (tp->mcfg == CFG_METHOD_2 || tp->mcfg == CFG_METHOD_3)
-            WriteReg8(0xD3, RTL_R8(tp, 0xD3) | BIT_0);
+            RTL_W8(tp, 0xD3, RTL_R8(tp, 0xD3) | BIT_0);
         
         rtl8125_disable_eee_plus(tp);
         
@@ -770,7 +815,7 @@ void LucyRTL8125::setupRTL8125()
         SetMcuAccessRegBit(tp, 0xEB54, BIT_0);
         udelay(1);
         ClearMcuAccessRegBit(tp, 0xEB54, BIT_0);
-        WriteReg16(0x1880, RTL_R16(tp, 0x1880) & ~(BIT_4 | BIT_5));
+        RTL_W16(tp, 0x1880, RTL_R16(tp, 0x1880) & ~(BIT_4 | BIT_5));
     }
     //other hw parameters
     rtl8125_hw_clear_timer_int(tp);
@@ -813,7 +858,7 @@ void LucyRTL8125::setupRTL8125()
                     Force_rxflow_en | Force_txflow_en | Cxpl_dbg_sel |
                     ASF | Macdbgo_sel);
 
-    WriteReg16(CPlusCmd, tp->cp_cmd);
+    RTL_W16(tp, CPlusCmd, tp->cp_cmd);
 
     switch (tp->mcfg) {
         case CFG_METHOD_2:
@@ -833,7 +878,7 @@ void LucyRTL8125::setupRTL8125()
      * Make sure that a packet fits into one buffer or there
      * will be trouble.
      */
-    WriteReg16(RxMaxSize, rxBufferSize - 1);
+    RTL_W16(tp, RxMaxSize, mtu + (ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN));
     
     rtl8125_disable_rxdvgate(tp);
 
@@ -851,19 +896,19 @@ void LucyRTL8125::setupRTL8125()
         case CFG_METHOD_4:
         case CFG_METHOD_5:
             if (linuxData.configASPM) {
-                WriteReg8(Config5, ReadReg8(Config5) | BIT_0);
-                WriteReg8(Config2, ReadReg8(Config2) | BIT_7);
+                RTL_W8(tp, Config5, RTL_R8(tp, Config5) | BIT_0);
+                RTL_W8(tp, Config2, RTL_R8(tp, Config2) | BIT_7);
             } else {
-                WriteReg8(Config2, ReadReg8(Config2) & ~BIT_7);
-                WriteReg8(Config5, ReadReg8(Config5) & ~BIT_0);
+                RTL_W8(tp, Config2, RTL_R8(tp, Config2) & ~BIT_7);
+                RTL_W8(tp, Config5, RTL_R8(tp, Config5) & ~BIT_0);
             }
             break;
     }
 
-    WriteReg8(Cfg9346, ReadReg8(Cfg9346) & ~Cfg9346_Unlock);
+    RTL_W8(tp, Cfg9346, RTL_R8(tp, Cfg9346) & ~Cfg9346_Unlock);
     
     /* Enable all known interrupts by setting the interrupt mask. */
-    WriteReg32(IMR0_8125, intrMask);
+    RTL_W32(tp, IMR0_8125, intrMask);
 
     udelay(10);
 }
@@ -1138,18 +1183,18 @@ void LucyRTL8125::hardwareD3Para()
     struct rtl8125_private *tp = &linuxData;
     
     /* Set RxMaxSize register */
-    WriteReg16(RxMaxSize, RX_BUF_SIZE);
+    RTL_W16(tp, RxMaxSize, RX_BUF_SIZE);
     
     switch (tp->mcfg) {
         case CFG_METHOD_2:
         case CFG_METHOD_3:
         case CFG_METHOD_4:
         case CFG_METHOD_5:
-            WriteReg8(0xF1, ReadReg8(0xF1) & ~BIT_7);
-            WriteReg8(Cfg9346, ReadReg8(Cfg9346) | Cfg9346_Unlock);
-            WriteReg8(Config2, ReadReg8(Config2) & ~BIT_7);
-            WriteReg8(Config5, ReadReg8(Config5) & ~BIT_0);
-            WriteReg8(Cfg9346, ReadReg8(Cfg9346) & ~Cfg9346_Unlock);
+            RTL_W8(tp, 0xF1, RTL_R8(tp, 0xF1) & ~BIT_7);
+            RTL_W8(tp, Cfg9346, RTL_R8(tp, Cfg9346) | Cfg9346_Unlock);
+            RTL_W8(tp, Config2, RTL_R8(tp, Config2) & ~BIT_7);
+            RTL_W8(tp, Config5, RTL_R8(tp, Config5) & ~BIT_0);
+            RTL_W8(tp, Cfg9346, RTL_R8(tp, Cfg9346) & ~Cfg9346_Unlock);
             break;
     }
     rtl8125_disable_exit_l1_mask(tp);
@@ -1204,7 +1249,7 @@ void LucyRTL8125::exitOOB()
     struct rtl8125_private *tp = &linuxData;
     UInt16 data16;
     
-    WriteReg32(RxConfig, ReadReg32(RxConfig) & ~(AcceptErr | AcceptRunt | AcceptBroadcast | AcceptMulticast | AcceptMyPhys |  AcceptAllPhys));
+    RTL_W32(tp, RxConfig, RTL_R32(tp, RxConfig) & ~(AcceptErr | AcceptRunt | AcceptBroadcast | AcceptMulticast | AcceptMyPhys |  AcceptAllPhys));
     
     switch (tp->mcfg) {
         case CFG_METHOD_2:
@@ -1275,9 +1320,9 @@ void LucyRTL8125::powerDownPLL()
 
         if (tp->mcfg == CFG_METHOD_2 || tp->mcfg == CFG_METHOD_3 ||
             tp->mcfg == CFG_METHOD_4 || tp->mcfg == CFG_METHOD_5) {
-            WriteReg8(Cfg9346, ReadReg8(Cfg9346) | Cfg9346_Unlock);
-            WriteReg8(Config2, ReadReg8(Config2) | PMSTS_En);
-            WriteReg8(Cfg9346, ReadReg8(Cfg9346) & ~Cfg9346_Unlock);
+            RTL_W8(tp, Cfg9346, RTL_R8(tp, Cfg9346) | Cfg9346_Unlock);
+            RTL_W8(tp, Config2, RTL_R8(tp, Config2) | PMSTS_En);
+            RTL_W8(tp, Cfg9346, RTL_R8(tp, Cfg9346) & ~Cfg9346_Unlock);
         }
 
         rtl8125_mdio_write(tp, 0x1F, 0x0000);
@@ -1312,7 +1357,7 @@ void LucyRTL8125::powerDownPLL()
             }
             rtl8125_phy_restart_nway(tp);
 
-            WriteReg32(RxConfig, ReadReg32(RxConfig) | AcceptBroadcast | AcceptMulticast | AcceptMyPhys);
+            RTL_W32(tp, RxConfig, RTL_R32(tp, RxConfig) | AcceptBroadcast | AcceptMulticast | AcceptMyPhys);
 
             return;
         }
@@ -1327,7 +1372,7 @@ void LucyRTL8125::powerDownPLL()
         case CFG_METHOD_3:
         case CFG_METHOD_4:
         case CFG_METHOD_5:
-            WriteReg8(PMCH, ReadReg8(PMCH) & ~BIT_7);
+            RTL_W8(tp, PMCH, RTL_R8(tp, PMCH) & ~BIT_7);
             break;
         }
 
@@ -1336,7 +1381,7 @@ void LucyRTL8125::powerDownPLL()
         case CFG_METHOD_3:
         case CFG_METHOD_4:
         case CFG_METHOD_5:
-            WriteReg8(0xF2, ReadReg8(0xF2) & ~BIT_6);
+            RTL_W8(tp, 0xF2, RTL_R8(tp, 0xF2) & ~BIT_6);
             break;
         }
 }
@@ -1593,7 +1638,7 @@ void LucyRTL8125::configPhyHardware8125a2()
                             0x0700
                             );
     
-    WriteReg16(EEE_TXIDLE_TIMER_8125, mtu + ETH_HLEN + 0x20);
+    RTL_W16(tp, EEE_TXIDLE_TIMER_8125, mtu + ETH_HLEN + 0x20);
     
     mdio_direct_write_phy_ocp(tp, 0xB87C, 0x80A2);
     mdio_direct_write_phy_ocp(tp, 0xB87E, 0x0153);
@@ -2006,7 +2051,7 @@ void LucyRTL8125::configPhyHardware8125b1()
     mdio_direct_write_phy_ocp(tp, 0xB87C, 0x8529);
     mdio_direct_write_phy_ocp(tp, 0xB87E, 0x050E);
     
-    WriteReg16(EEE_TXIDLE_TIMER_8125, mtu + ETH_HLEN + 0x20);
+    RTL_W16(tp, EEE_TXIDLE_TIMER_8125, mtu + ETH_HLEN + 0x20);
 
     mdio_direct_write_phy_ocp(tp, 0xA436, 0x816C);
     mdio_direct_write_phy_ocp(tp, 0xA438, 0xC4A0);
@@ -2196,7 +2241,7 @@ void LucyRTL8125::configPhyHardware8125b2()
                             );
     
     
-    WriteReg16(EEE_TXIDLE_TIMER_8125, mtu + ETH_HLEN + 0x20);
+    RTL_W16(tp, EEE_TXIDLE_TIMER_8125, mtu + ETH_HLEN + 0x20);
     
     mdio_direct_write_phy_ocp(tp, 0xB87C, 0x80F5);
     mdio_direct_write_phy_ocp(tp, 0xB87E, 0x760E);
