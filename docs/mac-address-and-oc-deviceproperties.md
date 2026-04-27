@@ -54,88 +54,94 @@
 - 兼容要求：保留 `Info.plist` 参数回退路径，避免破坏现有用户配置。
 - 如需强制固定 MAC：使用“注入优先于硬件值”的逻辑，而不是依赖“硬件值非法才 fallback”。
 
-## 7. 编译环境建议（本工程）
+## 7. 构建流程与环境约束（统一说明）
 
-结论：优先使用 **Xcode 15.2**（以及对应 Command Line Tools 15.2）。
+本节用于统一回答“在不同主机系统上，如何按工程预期构建并保持兼容范围”。
 
-依据（来自工程配置）：
+### 7.1 工程约束（决定兼容范围的核心）
 
-- `LastUpgradeCheck = 1520`（对应 Xcode 15.2）。
-- `CreatedOnToolsVersion = 11.4`，说明工程起源较早，但后续升级到较新工具链。
-- `compatibilityVersion = "Xcode 12.0"`，表示可向下兼容，不代表当前最稳编译版本。
-- 目标类型为传统 `kext`（`com.apple.product-type.kernel-extension`），对工具链变化更敏感，建议优先使用最后一次升级对应版本。
+- target 构建设置中，`MACOSX_DEPLOYMENT_TARGET = 10.15`，这决定了当前工程的最低目标版本语义为 `macOS 10.15+`。
+- `SDKROOT = macosx`，表示使用当前所选 Xcode 自带的 macOS SDK。
+- 工程使用 `MacKernelSDK/Headers` 与对应 `libkmod.a`，用于保持旧内核头与构建兼容能力。
+- 因此：主机系统版本不会直接改变“最低兼容目标”，除非你修改 deployment target 或引入超出目标版本的符号。
 
-建议组合：
+### 7.2 主机系统与 Xcode 约束
 
-1. 首选：Xcode 15.2 + CLT 15.2
-2. 可尝试：Xcode 15.3 / 15.4
-3. 不优先：Xcode 16.x（kext 项目潜在兼容差异更大）
+- 在 macOS 15（Sequoia）主机上，应使用该系统可正常运行的 Xcode 版本（通常为 Xcode 16.x）。
+- Xcode 15.2 属于 macOS 14 时代工具链，其内置 macOS SDK 最高为 14.2 SDK。
+- 对本工程而言，若你在 macOS 15 上构建，使用 Xcode 16.x 是正常组合；兼容边界仍由工程 deployment target 控制。
 
-## 8. 环境验证步骤
+### 7.3 标准构建步骤（建议固定）
 
-在终端执行以下命令确认当前工具链：
+1. 选择并切换目标 Xcode：
+
+```bash
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+sudo xcodebuild -license accept
+```
+
+2. 验证当前工具链：
 
 ```bash
 xcodebuild -version
 xcode-select -p
 clang --version
-pkgutil --pkg-info=com.apple.pkg.CLTools_Executables
 ```
 
-期望结果（目标环境）：
-
-- `xcodebuild -version` 显示 `Xcode 15.2`（Build version 通常为 `15C500b`）。
-- `xcode-select -p` 指向你要使用的 Xcode（如 `/Applications/Xcode_15.2.app/Contents/Developer`）。
-- `pkgutil --pkg-info=com.apple.pkg.CLTools_Executables` 版本为 15.2 对应范围。
-
-可选工程验证（仅编译，不签名安装）：
+3. 使用 Release 配置构建（仅编译，不处理安装）：
 
 ```bash
 cd /Users/tzraeq/workspace/kext/LucyRTL8125Ethernet
-xcodebuild -project LucyRTL8125Ethernet.xcodeproj -target LucyRTL8125Ethernet -configuration Release CODE_SIGNING_ALLOWED=NO build
+xcodebuild -project LucyRTL8125Ethernet.xcodeproj -target LucyRTL8125Ethernet -configuration Release -sdk macosx CODE_SIGNING_ALLOWED=NO build
 ```
 
-## 9. 安装指定版本教程（Xcode 15.2 + CLT 15.2）
+### 7.4 产物一致性校验（必须做）
 
-### 9.1 安装 Xcode 15.2
-
-推荐方式（官方）：
-
-1. 登录 [Apple Developer Downloads](https://developer.apple.com/download/all/)。
-2. 搜索并下载 `Xcode 15.2.xip`。
-3. 解压后将应用重命名为 `Xcode_15.2.app` 并放到 `/Applications`。
-
-### 9.2 切换到指定 Xcode
+- 校验最低目标版本字段（应体现 `10.15` 语义）：
 
 ```bash
-sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer
+otool -l build/Release/LucyRTL8125Ethernet.kext/Contents/MacOS/LucyRTL8125Ethernet | rg "LC_VERSION_MIN_MACOSX|minos|version"
+```
+
+- 校验架构（当前工程为 `x86_64`）：
+
+```bash
+lipo -info build/Release/LucyRTL8125Ethernet.kext/Contents/MacOS/LucyRTL8125Ethernet
+```
+
+### 7.5 排查原则
+
+- 若 `xcodebuild -version` 与预期不一致，先修正 `xcode-select`。
+- 若命令行工具版本混乱，优先保证 Xcode 与 CLT 来自同一版本体系。
+- 若产物校验不满足预期，先检查是否误改了 `MACOSX_DEPLOYMENT_TARGET`、`SDKROOT`、`ARCHS`。
+
+### 7.6 环境搭建步骤（安装到可用）
+
+1. 按主机系统选择可用 Xcode 主版本：
+   - macOS 14：可用 Xcode 15.2/15.4（15.2 对应 14.2 SDK）。
+   - macOS 15：优先 Xcode 16.x。
+
+2. 下载并安装 Xcode：
+   - 从 [Apple Developer Downloads](https://developer.apple.com/download/all/) 下载对应 `.xip`。
+   - 解压后放到 `/Applications`（可命名为 `Xcode_16.x.app` 或 `Xcode_15.2.app` 便于并存）。
+
+3. 切换命令行开发目录并接受许可：
+
+```bash
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 sudo xcodebuild -license accept
 ```
 
-再次验证：
+4. 安装或对齐 Command Line Tools（CLT）：
+   - 方式 A（推荐）：首次打开目标 Xcode，等待组件安装完成。
+   - 方式 B（手动）：安装对应版本 `Command Line Tools for Xcode` 安装包。
+
+5. 最终验证（必须通过）：
 
 ```bash
 xcodebuild -version
 xcode-select -p
-```
-
-### 9.3 安装匹配的 Command Line Tools
-
-方式 A（推荐，随 Xcode 组件匹配）：
-
-- 打开 `Xcode_15.2` 一次，等待必要组件安装完成。
-
-方式 B（手动）：
-
-1. 在 Apple Developer Downloads 下载对应版本 `Command Line Tools for Xcode 15.2` 的 `.dmg`。
-2. 双击安装后执行验证命令：
-
-```bash
 pkgutil --pkg-info=com.apple.pkg.CLTools_Executables
 ```
 
-### 9.4 常见问题排查
-
-- 若 `xcodebuild` 仍显示旧版本：重新执行 `sudo xcode-select -s ...`。
-- 若提示许可协议未接受：执行 `sudo xcodebuild -license accept`。
-- 若编译仍调用旧工具链：重启终端后再执行一次 `xcodebuild -version` 与工程编译命令确认。
+6. 进入“标准构建步骤”执行编译与产物校验（见 7.3 与 7.4）。
