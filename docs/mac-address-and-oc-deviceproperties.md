@@ -16,7 +16,7 @@
   - 非组播地址（首字节最低位不能是 1）；
   - `FF:FF:FF:FF:FF:FF` 也会因组播规则被判无效。
 - 关键点：`fallbackMAC` 仅在硬件读到的 MAC 不合法时才参与当前分支；默认不是“强制覆盖合法原始 MAC”。
-- 边界注意：当前 `initRTL8125()` 的 fallback 分支没有再次校验 `fallbackMAC` 本身是否有效。
+- 关键点：当前代码**会再次校验** `fallbackMAC`（对应 `fallBackMacAddr`）是否有效；只有在 `fallbackMAC` 也合法时才会采用，否则继续尝试 `BACKUP_ADDR`，最后生成随机 MAC。
 
 ## 3. 当前代码是否读取 OpenCore `DeviceProperties`
 
@@ -30,19 +30,21 @@
 
 根据 OpenCore 文档与社区实践，`DeviceProperties` 会进入 IORegistry，驱动应从对应设备节点读取：
 
-- 在驱动中优先从 `IOPCIDevice`（provider）读取，例如 `pciDevice->getProperty("fallbackMAC")`。
+- 在驱动中优先从 `IOPCIDevice`（provider）读取，例如 `pciDevice->getProperty("mac-address")`。
 - 读不到时再回退到 `Info.plist` 的 `Driver Parameters`（兼容历史配置）。
-- 建议兼容多类型：`OSString` / `OSData` / `OSNumber`，避免因注入类型不一致导致读取失败。
+- 为保持与现有 `fallbackMAC` 行为一致，`mac-address` **仅支持 `OSString`**，格式为 `xx:xx:xx:xx:xx:xx`（十六进制，不区分大小写）。不支持 `OSData` / `OSNumber`。
 
 推荐优先级：
 
-1. `pciDevice->getProperty("...")`（OpenCore 注入）
-2. `Driver Parameters`（Info.plist）
-3. 默认值
+1. `pciDevice->getProperty("mac-address")`（OpenCore 注入，强制覆盖）
+2. 硬件 MAC（若合法）
+3. `Driver Parameters -> fallbackMAC`（若合法）
+4. `BACKUP_ADDR0_8125/BACKUP_ADDR1_8125`（若合法）
+5. 随机 MAC（本地管理地址）
 
 ## 5. 是否可用 `DeviceProperties Delete` 直接改 `IOMACAddress`
 
-结论：**不建议把它当作稳定方案，通常不能保证链路层 MAC 最终生效。**
+结论：**不采用该方案**（不建议把它当作稳定方案，通常不能保证链路层 MAC 最终生效）。
 
 - `DeviceProperties Add/Delete` 修改的是指定设备节点属性，不等同于驱动最终采用该值写入硬件。
 - 本驱动会在初始化阶段按自身流程读硬件并调用 `rtl8125_rar_set()`，随后由 `currMacAddr` 对外提供地址。
@@ -50,9 +52,9 @@
 
 ## 6. 推荐落地方案
 
-- 最稳妥方案：在驱动中新增或复用注入键（如 `overrideMAC` / `fallbackMAC`），显式读取 `pciDevice` 属性并执行 `rtl8125_rar_set()`。
-- 兼容要求：保留 `Info.plist` 参数回退路径，避免破坏现有用户配置。
-- 如需强制固定 MAC：使用“注入优先于硬件值”的逻辑，而不是依赖“硬件值非法才 fallback”。
+- 最稳妥方案：在驱动中新增注入键 `mac-address`（`OSString`），显式读取 `pciDevice` 属性并执行 `rtl8125_rar_set()`。
+- 兼容要求：保留 `Info.plist` 的 `Driver Parameters -> fallbackMAC` 回退路径，避免破坏现有用户配置。
+- 强制固定 MAC：`mac-address` 采用“注入优先于硬件值”的逻辑；`fallbackMAC` 保持原本语义（仅在硬件 MAC 不合法时参与）。
 
 ## 7. 构建流程与环境约束（统一说明）
 
@@ -97,10 +99,10 @@ xcodebuild -project LucyRTL8125Ethernet.xcodeproj -target LucyRTL8125Ethernet -c
 
 ### 7.4 产物一致性校验（必须做）
 
-- 校验最低目标版本字段（应体现 `10.15` 语义）：
+- 优先以构建设置校验目标版本（对本工程最可靠）：
 
 ```bash
-otool -l build/Release/LucyRTL8125Ethernet.kext/Contents/MacOS/LucyRTL8125Ethernet | rg "LC_VERSION_MIN_MACOSX|minos|version"
+xcodebuild -project LucyRTL8125Ethernet.xcodeproj -target LucyRTL8125Ethernet -configuration Release -showBuildSettings | rg "^\s*(MACOSX_DEPLOYMENT_TARGET|SDKROOT|ARCHS|KERNEL_EXTENSION_HEADER_SEARCH_PATHS|KERNEL_FRAMEWORK_HEADERS|WRAPPER_EXTENSION)\s*="
 ```
 
 - 校验架构（当前工程为 `x86_64`）：
