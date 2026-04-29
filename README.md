@@ -15,7 +15,35 @@ A macOS driver for Realtek RTL8125 2.5GBit Ethernet Controllers
 * Supports Wake on LAN.
 * Supports VLAN.
 * Support for Energy Efficient Ethernet (EEE).
+* Supports optional MAC override via OpenCore `DeviceProperties` injection (`mac-address`).
 * The driver is published under GPLv2.
+
+**OpenCore `mac-address` injection**
+
+The driver can read an optional `mac-address` property from the matching `IOPCIDevice` (typically injected through OpenCore `DeviceProperties -> Add`) and use it as the interface MAC address.
+
+Recommended format for `mac-address`:
+
+* `string`: `xx:xx:xx:xx:xx:xx`
+* In OpenCore Configurator, set the value type to **String**.
+
+If `mac-address` is missing or invalid, the driver falls back to its normal MAC selection flow (hardware MAC, `fallbackMAC`, backup/random path).
+
+Example (`config.plist`):
+
+```xml
+<key>DeviceProperties</key>
+<dict>
+  <key>Add</key>
+  <dict>
+    <key>PciRoot(...)/Pci(...)</key>
+    <dict>
+      <key>mac-address</key>
+      <string>xx:xx:xx:xx:xx:xx</string>
+    </dict>
+  </dict>
+</dict>
+```
 
 
 **Support**
