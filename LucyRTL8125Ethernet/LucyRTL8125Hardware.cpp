@@ -241,6 +241,8 @@ bool LucyRTL8125::initRTL8125()
     struct rtl8125_private *tp = &linuxData;
     UInt32 i;
     UInt8 macAddr[MAC_ADDR_LEN];
+    UInt8 backupAddr[MAC_ADDR_LEN];
+    bool macAssigned = false;
     bool result = false;
     
     /* Identify chip attached to board. */
@@ -496,23 +498,68 @@ bool LucyRTL8125::initRTL8125()
     if (tp->eeprom_type == EEPROM_TYPE_93C46 || tp->eeprom_type == EEPROM_TYPE_93C56)
             rtl8125_set_eeprom_sel_low(tp);
 
-    for (i = 0; i < MAC_ADDR_LEN; i++)
+    /*
+     * MAC selection follows the priority documented in
+     * docs/mac-address-and-oc-deviceproperties.md:
+     *   1. OpenCore-injected `mac-address` on the IOPCIDevice (force override).
+     *   2. Hardware MAC programmed in MAC0..MAC5.
+     *   3. `Driver Parameters -> fallbackMAC` from Info.plist (must be valid).
+     *   4. BACKUP_ADDR0_8125 / BACKUP_ADDR1_8125 on supported CFG methods.
+     *   5. Random locally-administered address as the last resort.
+     * Only the chosen address is committed to the receive address registers
+     * via `rtl8125_rar_set()` so the driver and hardware stay consistent.
+     */
+
+    if (is_valid_ether_addr((UInt8 *)injectedMacAddr.bytes)) {
+        IOLog("LucyRTL8125: Using injected MAC: %2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x\n",
+              injectedMacAddr.bytes[0], injectedMacAddr.bytes[1],
+              injectedMacAddr.bytes[2], injectedMacAddr.bytes[3],
+              injectedMacAddr.bytes[4], injectedMacAddr.bytes[5]);
+        rtl8125_rar_set(tp, injectedMacAddr.bytes);
+        macAssigned = true;
+    }
+
+    if (!macAssigned) {
+        for (i = 0; i < MAC_ADDR_LEN; i++)
             macAddr[i] = RTL_R8(tp, MAC0 + i);
 
-    if(tp->mcfg == CFG_METHOD_2 ||
-        tp->mcfg == CFG_METHOD_3 ||
-        tp->mcfg == CFG_METHOD_4 ||
-        tp->mcfg == CFG_METHOD_5) {
-            *(UInt32*)&macAddr[0] = RTL_R32(tp, BACKUP_ADDR0_8125);
-            *(UInt16*)&macAddr[4] = RTL_R16(tp, BACKUP_ADDR1_8125);
+        if (is_valid_ether_addr((UInt8 *)macAddr)) {
+            rtl8125_rar_set(tp, macAddr);
+            macAssigned = true;
+        }
     }
 
-    if (is_valid_ether_addr((UInt8 *) macAddr)) {
-        rtl8125_rar_set(tp, macAddr);
-    } else {
+    if (!macAssigned && is_valid_ether_addr((UInt8 *)fallBackMacAddr.bytes)) {
         IOLog("Using fallback MAC.\n");
         rtl8125_rar_set(tp, fallBackMacAddr.bytes);
+        macAssigned = true;
     }
+
+    if (!macAssigned &&
+        (tp->mcfg == CFG_METHOD_2 ||
+         tp->mcfg == CFG_METHOD_3 ||
+         tp->mcfg == CFG_METHOD_4 ||
+         tp->mcfg == CFG_METHOD_5)) {
+        *(UInt32 *)&backupAddr[0] = RTL_R32(tp, BACKUP_ADDR0_8125);
+        *(UInt16 *)&backupAddr[4] = RTL_R16(tp, BACKUP_ADDR1_8125);
+
+        if (is_valid_ether_addr((UInt8 *)backupAddr)) {
+            IOLog("Using backup MAC.\n");
+            rtl8125_rar_set(tp, backupAddr);
+            macAssigned = true;
+        }
+    }
+
+    if (!macAssigned) {
+        random_buf(macAddr, MAC_ADDR_LEN);
+        macAddr[0] &= 0xfe;   /* clear multicast bit */
+        macAddr[0] |= 0x02;   /* set locally administered bit (IEEE 802) */
+        IOLog("Using random MAC: %2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x\n",
+              macAddr[0], macAddr[1], macAddr[2],
+              macAddr[3], macAddr[4], macAddr[5]);
+        rtl8125_rar_set(tp, macAddr);
+    }
+
     for (i = 0; i < MAC_ADDR_LEN; i++) {
         currMacAddr.bytes[i] = RTL_R8(tp, MAC0 + i);
         origMacAddr.bytes[i] = currMacAddr.bytes[i]; /* keep the original MAC address */

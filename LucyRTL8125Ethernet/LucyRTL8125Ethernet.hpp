@@ -290,6 +290,14 @@ enum
 #define kDisableASPMName "disableASPM"
 #define kDriverVersionName "Driver Version"
 #define kFallbackName "fallbackMAC"
+
+/*
+ * Property key consumed from the IOPCIDevice (provider) and typically
+ * supplied through OpenCore's `DeviceProperties` -> `Add` injection.
+ * Supports OSString and OSData (raw 6-byte or ASCII form).
+ */
+#define kInjectedMacAddrName "mac-address"
+
 #define kNameLenght 64
 
 #define kEnableRxPollName "rxPolling"
@@ -413,6 +421,7 @@ private:
     static IOReturn setPowerStateWakeAction(OSObject *owner, void *arg1, void *arg2, void *arg3, void *arg4);
     static IOReturn setPowerStateSleepAction(OSObject *owner, void *arg1, void *arg2, void *arg3, void *arg4);
     void getParams();
+    void readInjectedMacAddr();
     bool setupMediumDict();
     bool initEventSources(IOService *provider);
     
@@ -563,6 +572,7 @@ private:
     struct IOEthernetAddress currMacAddr;
     struct IOEthernetAddress origMacAddr;
     struct IOEthernetAddress fallBackMacAddr;
+    struct IOEthernetAddress injectedMacAddr;
 
     UInt32 pollInterval2500;
     UInt32 intrMask;

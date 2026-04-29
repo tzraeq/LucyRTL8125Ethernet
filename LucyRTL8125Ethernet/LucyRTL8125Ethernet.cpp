@@ -91,6 +91,7 @@ bool LucyRTL8125::init(OSDictionary *properties)
         useAppleVTD = false;
         pciPMCtrlOffset = 0;
         memset(fallBackMacAddr.bytes, 0, kIOEthernetAddressSize);
+        memset(injectedMacAddr.bytes, 0, kIOEthernetAddressSize);
         nanoseconds_to_absolutetime(kStatDelayTime, &statDelay);
         nanoseconds_to_absolutetime(kTimerPeriod, &timerInterval);
 

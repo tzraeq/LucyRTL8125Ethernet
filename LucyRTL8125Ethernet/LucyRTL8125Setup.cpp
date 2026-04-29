@@ -125,6 +125,118 @@ void LucyRTL8125::getParams()
         IOLog("LucyRTL8125Ethernet version %s starting. Please don't support tonymacx86.com!\n", versionString->getCStringNoCopy());
     else
         IOLog("LucyRTL8125Ethernet starting. Please don't support tonymacx86.com!\n");
+
+    readInjectedMacAddr();
+}
+
+/*
+ * Reads the optional `mac-address` property from the IOPCIDevice provider.
+ *
+ * The value is typically injected through OpenCore's `DeviceProperties`
+ * (e.g. `PciRoot(...)/Pci(...)` -> `mac-address`).
+ * Accepted forms:
+ *   1) OSString: `xx:xx:xx:xx:xx:xx`
+ *   2) OSData: six raw bytes
+ *   3) OSData: ASCII `xx:xx:xx:xx:xx:xx` (with or without trailing NUL)
+ *
+ * On success the parsed MAC is stored in `injectedMacAddr`. On any
+ * failure (missing key, wrong type, malformed string, invalid Ethernet
+ * address) the buffer is left zeroed so downstream logic naturally falls
+ * back to the hardware MAC / fallbackMAC / BACKUP_ADDR / random path.
+ */
+void LucyRTL8125::readInjectedMacAddr()
+{
+    OSString *macStr;
+    OSData *macData;
+    UInt8 tmp[MAC_ADDR_LEN];
+    int parsed;
+    const void *bytes;
+    unsigned int length;
+    const char *asciiMac;
+    char asciiBuf[(3 * MAC_ADDR_LEN) + 1];
+
+    memset(injectedMacAddr.bytes, 0, kIOEthernetAddressSize);
+
+    if (NULL == pciDevice)
+        return;
+
+    macStr = OSDynamicCast(OSString, pciDevice->getProperty(kInjectedMacAddrName));
+
+    if (NULL != macStr && 0 != macStr->getLength()) {
+        parsed = sscanf(macStr->getCStringNoCopy(),
+                        "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx",
+                        &tmp[0], &tmp[1], &tmp[2], &tmp[3], &tmp[4], &tmp[5]);
+
+        if (6 != parsed || !is_valid_ether_addr(tmp)) {
+            IOLog("LucyRTL8125: Ignoring invalid injected mac-address (OSString): %s\n",
+                  macStr->getCStringNoCopy());
+            return;
+        }
+
+        memcpy(injectedMacAddr.bytes, tmp, MAC_ADDR_LEN);
+
+        IOLog("LucyRTL8125: Injected MAC: %2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x\n",
+              injectedMacAddr.bytes[0], injectedMacAddr.bytes[1],
+              injectedMacAddr.bytes[2], injectedMacAddr.bytes[3],
+              injectedMacAddr.bytes[4], injectedMacAddr.bytes[5]);
+        return;
+    }
+
+    macData = OSDynamicCast(OSData, pciDevice->getProperty(kInjectedMacAddrName));
+
+    if (NULL == macData) {
+        IOLog("LucyRTL8125: No injected mac-address found on provider.\n");
+        return;
+    }
+
+    bytes = macData->getBytesNoCopy();
+    length = macData->getLength();
+
+    if (MAC_ADDR_LEN == length && NULL != bytes) {
+        memcpy(tmp, bytes, MAC_ADDR_LEN);
+
+        if (!is_valid_ether_addr(tmp)) {
+            IOLog("LucyRTL8125: Ignoring invalid injected mac-address (OSData raw bytes).\n");
+            return;
+        }
+
+        memcpy(injectedMacAddr.bytes, tmp, MAC_ADDR_LEN);
+
+        IOLog("LucyRTL8125: Injected MAC: %2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x\n",
+              injectedMacAddr.bytes[0], injectedMacAddr.bytes[1],
+              injectedMacAddr.bytes[2], injectedMacAddr.bytes[3],
+              injectedMacAddr.bytes[4], injectedMacAddr.bytes[5]);
+        return;
+    }
+
+    if (NULL == bytes || 0 == length || length > (3 * MAC_ADDR_LEN)) {
+        IOLog("LucyRTL8125: Ignoring unsupported injected mac-address OSData length: %u\n", length);
+        return;
+    }
+
+    memcpy(asciiBuf, bytes, length);
+    asciiBuf[length] = '\0';
+
+    asciiMac = asciiBuf;
+
+    if ('\0' == asciiMac[length - 1])
+        asciiMac = reinterpret_cast<const char *>(bytes);
+
+    parsed = sscanf(asciiMac,
+                    "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx",
+                    &tmp[0], &tmp[1], &tmp[2], &tmp[3], &tmp[4], &tmp[5]);
+
+    if (6 != parsed || !is_valid_ether_addr(tmp)) {
+        IOLog("LucyRTL8125: Ignoring invalid injected mac-address (OSData string): %s\n", asciiMac);
+        return;
+    }
+
+    memcpy(injectedMacAddr.bytes, tmp, MAC_ADDR_LEN);
+
+    IOLog("LucyRTL8125: Injected MAC: %2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x\n",
+          injectedMacAddr.bytes[0], injectedMacAddr.bytes[1],
+          injectedMacAddr.bytes[2], injectedMacAddr.bytes[3],
+          injectedMacAddr.bytes[4], injectedMacAddr.bytes[5]);
 }
 
 static IOMediumType mediumTypeArray[MEDIUM_INDEX_COUNT] = {
