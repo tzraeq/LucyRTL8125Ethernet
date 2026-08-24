@@ -319,8 +319,10 @@ IOReturn LucyRTL8125::setPowerState(unsigned long powerStateOrdinal, IOService *
     
     if (powerStateOrdinal == kPowerStateOff)
         commandGate->runAction(setPowerStateSleepAction);
-    else
+    else {
         commandGate->runAction(setPowerStateWakeAction);
+        rtl8125_rar_set(&linuxData, (UInt8 *)&currMacAddr.bytes);
+    }
 
     powerState = powerStateOrdinal;
     
