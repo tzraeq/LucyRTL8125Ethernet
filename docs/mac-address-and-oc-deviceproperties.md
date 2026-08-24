@@ -1,88 +1,93 @@
-# MAC 地址与 OpenCore 注入结论
+# MAC-cím és az OpenCore injektálásának következtetései
 
-## 1. 当前驱动的 MAC 读取与生效路径
+## 1. A jelenlegi driver MAC-címének beolvasási és érvényesítési folyamata
 
-- 驱动启动时在 `start()` 调用 `initRTL8125()` 完成 MAC 初始化。
-- `initRTL8125()` 会先从硬件寄存器 `MAC0..MAC5` 读取 MAC；部分芯片配置会优先使用 `BACKUP_ADDR0_8125/BACKUP_ADDR1_8125`。
-- 读取后若地址合法，直接写入硬件接收地址寄存器（`rtl8125_rar_set()` -> `MAC0/MAC4`）。
-- 若读取结果不合法，当前代码分支会使用 `fallbackMAC`。
-- 对外上报 MAC 由 `getHardwareAddress()` 返回 `currMacAddr`；运行时可通过 `setHardwareAddress()` 改写 `currMacAddr` 并调用 `rtl8125_rar_set()`。
+- A driver indulásakor a `start()` meghívja az `initRTL8125()` függvényt, amely elvégzi a MAC-cím inicializálását.
+- Az `initRTL8125()` először a hardver `MAC0..MAC5` regisztereiből olvassa ki a MAC-címet; bizonyos chipkonfigurációk esetén elsőbbséget élvezhet a `BACKUP_ADDR0_8125/BACKUP_ADDR1_8125`.
+- Ha a beolvasott cím érvényes, közvetlenül beírja azt a hardver vételi címregiszterébe (`rtl8125_rar_set()` -> `MAC0/MAC4`).
+- Ha a beolvasott eredmény érvénytelen, a jelenlegi kódág a `fallbackMAC` értékét használja.
+- A külvilág felé jelentett MAC-címet a `getHardwareAddress()` adja vissza a `currMacAddr` értékéből; futás közben a `setHardwareAddress()` módosíthatja a `currMacAddr` értékét, majd meghívja a `rtl8125_rar_set()` függvényt.
 
-## 2. `fallbackMAC` 的真实行为
+## 2. A `fallbackMAC` tényleges működése
 
-- `fallbackMAC` 来源于 `Info.plist` 的 `Driver Parameters` 字典（当前代码路径）。
-- 判定“合法 MAC”使用 `is_valid_ether_addr()`：
-  - 非全 0；
-  - 非组播地址（首字节最低位不能是 1）；
-  - `FF:FF:FF:FF:FF:FF` 也会因组播规则被判无效。
-- 关键点：`fallbackMAC` 仅在硬件读到的 MAC 不合法时才参与当前分支；默认不是“强制覆盖合法原始 MAC”。
-- 关键点：当前代码**会再次校验** `fallbackMAC`（对应 `fallBackMacAddr`）是否有效；只有在 `fallbackMAC` 也合法时才会采用，否则继续尝试 `BACKUP_ADDR`，最后生成随机 MAC。
+- A `fallbackMAC` forrása az `Info.plist` `Driver Parameters` szótára (a jelenlegi kódban).
+- Az „érvényes MAC-cím” ellenőrzésére az `is_valid_ether_addr()` szolgál:
+  - nem lehet teljesen nulla;
+  - nem lehet multicast cím (az első bájt legalsó bitje nem lehet 1);
+  - a `FF:FF:FF:FF:FF:FF` cím szintén érvénytelennek minősül a multicast-szabály miatt.
+- Fontos: a `fallbackMAC` a jelenlegi kódban **csak akkor vesz részt**, ha a hardverből kiolvasott MAC-cím érvénytelen; alapértelmezés szerint tehát **nem írja felül a hardver érvényes eredeti MAC-címét**.
+- Fontos: a jelenlegi kód **újra ellenőrzi** a `fallbackMAC`-ot (a hozzá tartozó `fallBackMacAddr` értéket); csak akkor használja, ha az is érvényes. Ellenkező esetben tovább próbálkozik a `BACKUP_ADDR` értékekkel, végül pedig véletlenszerű MAC-címet generál.
 
-## 3. 当前代码是否读取 OpenCore `DeviceProperties`
+## 3. A jelenlegi kód beolvassa-e az OpenCore `DeviceProperties` értékeit?
 
-结论：**当前代码没有读取 OC 注入到 `IOPCIDevice` 节点的属性。**
+Következtetés: **a jelenlegi kód nem olvassa az OC által az `IOPCIDevice` csomópontjába injektált tulajdonságokat.**
 
-- 现有实现读取的是驱动服务自身属性：`getProperty("Driver Parameters")`。
-- 未见 `pciDevice->getProperty(...)` 这类从 provider（`IOPCIDevice`）读取注入属性的逻辑。
-- 因此按现状，`DeviceProperties -> Add -> PciRoot(...)/Pci(...)` 的自定义键默认不会被驱动消费。
+- A jelenlegi implementáció maga a driver szolgáltatásának tulajdonságait olvassa: `getProperty("Driver Parameters")`.
+- Nem található olyan logika, például `pciDevice->getProperty(...)`, amely a providertől (`IOPCIDevice`) olvasna be injektált tulajdonságokat.
+- Ezért a jelenlegi állapotban a `DeviceProperties -> Add -> PciRoot(...)/Pci(...)` alatt megadott egyéni kulcsokat a driver alapértelmezés szerint nem használja fel.
 
-## 4. 读取 OC 注入属性的正确方式
+## 4. Az OC által injektált tulajdonságok helyes beolvasási módja
 
-根据 OpenCore 文档与社区实践，`DeviceProperties` 会进入 IORegistry，驱动应从对应设备节点读取：
+Az OpenCore dokumentációja és a közösségi gyakorlat alapján a `DeviceProperties` bekerül az IORegistry-be, ezért a drivernek a megfelelő eszközcsomópontból kell kiolvasnia:
 
-- 在驱动中优先从 `IOPCIDevice`（provider）读取，例如 `pciDevice->getProperty("mac-address")`。
-- 读不到时再回退到 `Info.plist` 的 `Driver Parameters`（兼容历史配置）。
-- 为保持与现有 `fallbackMAC` 行为一致，`mac-address` **仅支持 `OSString`**，格式为 `xx:xx:xx:xx:xx:xx`（十六进制，不区分大小写）。不支持 `OSData` / `OSNumber`。
+- A driverben elsődlegesen az `IOPCIDevice`-től (providertől) kell olvasni, például:
 
-推荐优先级：
+```cpp
+pciDevice->getProperty("mac-address")
+```
 
-1. `pciDevice->getProperty("mac-address")`（OpenCore 注入，强制覆盖）
-2. 硬件 MAC（若合法）
-3. `Driver Parameters -> fallbackMAC`（若合法）
-4. `BACKUP_ADDR0_8125/BACKUP_ADDR1_8125`（若合法）
-5. 随机 MAC（本地管理地址）
+- Ha ez nem található, akkor vissza lehet térni az `Info.plist` `Driver Parameters` értékéhez (a korábbi konfigurációkkal való kompatibilitás érdekében).
+- A meglévő `fallbackMAC` működésével való kompatibilitás megőrzése érdekében a `mac-address` **csak `OSString` típusú értéket támogat**, `xx:xx:xx:xx:xx:xx` formátumban (hexadecimális, a kis- és nagybetűk nem számítanak). `OSData` / `OSNumber` nem támogatott.
 
-## 5. 是否可用 `DeviceProperties Delete` 直接改 `IOMACAddress`
+### Ajánlott prioritási sorrend
 
-结论：**不采用该方案**（不建议把它当作稳定方案，通常不能保证链路层 MAC 最终生效）。
+1. `pciDevice->getProperty("mac-address")` — OpenCore által injektált érték, **kényszerített felülírás**
+2. Hardveres MAC-cím — ha érvényes
+3. `Driver Parameters -> fallbackMAC` — ha érvényes
+4. `BACKUP_ADDR0_8125/BACKUP_ADDR1_8125` — ha érvényes
+5. Véletlenszerű MAC-cím — lokálisan kezelt cím (Locally Administered Address)
 
-- `DeviceProperties Add/Delete` 修改的是指定设备节点属性，不等同于驱动最终采用该值写入硬件。
-- 本驱动会在初始化阶段按自身流程读硬件并调用 `rtl8125_rar_set()`，随后由 `currMacAddr` 对外提供地址。
-- 即便某节点里能看到 `IOMACAddress` 变化，也可能被驱动初始化流程覆盖，出现“属性变了但实际 MAC 未变”。
+## 5. Használható-e a `DeviceProperties Delete` közvetlenül az `IOMACAddress` módosítására?
 
-## 6. 推荐落地方案
+Következtetés: **ezt a megoldást nem javasolt alkalmazni**; stabil megoldásként nem érdemes erre támaszkodni, mert általában nem garantálható, hogy a MAC-cím ténylegesen a hálózati rétegben is megváltozik.
 
-- 最稳妥方案：在驱动中新增注入键 `mac-address`（`OSString`），显式读取 `pciDevice` 属性并执行 `rtl8125_rar_set()`。
-- 兼容要求：保留 `Info.plist` 的 `Driver Parameters -> fallbackMAC` 回退路径，避免破坏现有用户配置。
-- 强制固定 MAC：`mac-address` 采用“注入优先于硬件值”的逻辑；`fallbackMAC` 保持原本语义（仅在硬件 MAC 不合法时参与）。
+- A `DeviceProperties Add/Delete` egy adott eszközcsomópont tulajdonságait módosítja; ez nem azonos azzal, hogy a driver végül ezt az értéket használja és beírja a hardverbe.
+- Ez a driver az inicializálás során a saját folyamatát követi: kiolvassa a hardverből a MAC-címet, majd meghívja a `rtl8125_rar_set()` függvényt, ezt követően pedig a `currMacAddr` szolgáltatja a címet a rendszer felé.
+- Még ha egy adott csomópontban az `IOMACAddress` értéke meg is változik, azt a driver inicializációs folyamata felülírhatja. Így előállhat az a helyzet, hogy **a tulajdonság megváltozott, de a tényleges MAC-cím nem**.
 
-## 7. 构建流程与环境约束（统一说明）
+## 6. Ajánlott végleges megoldás
 
-本节用于统一回答“在不同主机系统上，如何按工程预期构建并保持兼容范围”。
+- A legstabilabb megoldás: a driverben új `mac-address` injektálási kulcs bevezetése (`OSString`), amely explicit módon kiolvassa az `pciDevice` tulajdonságát, majd végrehajtja a `rtl8125_rar_set()` hívást.
+- Kompatibilitási követelmény: az `Info.plist` `Driver Parameters -> fallbackMAC` visszalépési útvonalát meg kell tartani, hogy a meglévő felhasználói konfigurációk ne sérüljenek.
+- Fix MAC-cím kényszerítéséhez a `mac-address` értéknek **elsőbbséget kell élveznie a hardveres értékkel szemben**; a `fallbackMAC` eredeti jelentése változatlan maradjon, vagyis csak akkor vegyen részt, ha a hardveres MAC-cím érvénytelen.
 
-### 7.1 工程约束（决定兼容范围的核心）
+## 7. Build-folyamat és környezeti követelmények — egységes leírás
 
-- target 构建设置中，`MACOSX_DEPLOYMENT_TARGET = 10.15`，这决定了当前工程的最低目标版本语义为 `macOS 10.15+`。
-- `SDKROOT = macosx`，表示使用当前所选 Xcode 自带的 macOS SDK。
-- 工程使用 `MacKernelSDK/Headers` 与对应 `libkmod.a`，用于保持旧内核头与构建兼容能力。
-- 因此：主机系统版本不会直接改变“最低兼容目标”，除非你修改 deployment target 或引入超出目标版本的符号。
+Ez a rész azt hivatott egységesen tisztázni, hogy különböző hostrendszereken hogyan lehet a projektet az elvárt módon lefordítani úgy, hogy a kompatibilitási tartomány megmaradjon.
 
-### 7.2 主机系统与 Xcode 约束
+### 7.1 Projektkövetelmények — a kompatibilitási tartományt meghatározó fő tényezők
 
-- 在 macOS 15（Sequoia）主机上，应使用该系统可正常运行的 Xcode 版本（通常为 Xcode 16.x）。
-- Xcode 15.2 属于 macOS 14 时代工具链，其内置 macOS SDK 最高为 14.2 SDK。
-- 对本工程而言，若你在 macOS 15 上构建，使用 Xcode 16.x 是正常组合；兼容边界仍由工程 deployment target 控制。
+- A target buildbeállításban `MACOSX_DEPLOYMENT_TARGET = 10.15`. Ez azt jelenti, hogy a projekt minimális célzott verziója jelenleg **macOS 10.15+**.
+- `SDKROOT = macosx`, vagyis a kiválasztott Xcode által biztosított aktuális macOS SDK használata történik.
+- A projekt a `MacKernelSDK/Headers` könyvtárat és a hozzá tartozó `libkmod.a` fájlt használja a régebbi kernel-headerek és a build-kompatibilitás fenntartása érdekében.
+- Ezért a hostrendszer verziója **önmagában nem változtatja meg a minimális kompatibilitási célt**, kivéve, ha módosítod a deployment targetet, vagy a célverzión túlmutató szimbólumokat vezetsz be.
 
-### 7.3 标准构建步骤（建议固定）
+### 7.2 Hostrendszer és Xcode követelményei
 
-1. 选择并切换目标 Xcode：
+- macOS 15 (Sequoia) hoston olyan Xcode-verziót kell használni, amely normálisan fut az adott rendszeren — jellemzően Xcode 16.x-et.
+- Az Xcode 15.2 a macOS 14 korszakának toolchainje; a benne található legmagasabb macOS SDK a 14.2 SDK.
+- Ennél a projektnél, ha macOS 15 alatt végzed a buildet, az **Xcode 16.x használata a megfelelő kombináció**; a kompatibilitási határt továbbra is a projekt deployment targetje határozza meg.
+
+### 7.3 Standard buildlépések — ajánlott fix folyamat
+
+**1. A célként használt Xcode kiválasztása és beállítása:**
 
 ```bash
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 sudo xcodebuild -license accept
 ```
 
-2. 验证当前工具链：
+**2. Az aktuális toolchain ellenőrzése:**
 
 ```bash
 xcodebuild -version
@@ -90,55 +95,58 @@ xcode-select -p
 clang --version
 ```
 
-3. 使用 Release 配置构建（仅编译，不处理安装）：
+**3. Build Release konfigurációval** — csak fordítás, telepítés nélkül:
 
 ```bash
 cd /Users/tzraeq/workspace/kext/LucyRTL8125Ethernet
 xcodebuild -project LucyRTL8125Ethernet.xcodeproj -target LucyRTL8125Ethernet -configuration Release -sdk macosx CODE_SIGNING_ALLOWED=NO build
 ```
 
-### 7.4 产物一致性校验（必须做）
+### 7.4 A buildelt eredmény konzisztenciájának ellenőrzése — kötelező
 
-- 优先以构建设置校验目标版本（对本工程最可靠）：
+- Elsődlegesen a buildbeállításokkal ellenőrizd a célverziót, mert ennél a projektnél ez a legmegbízhatóbb módszer:
 
 ```bash
 xcodebuild -project LucyRTL8125Ethernet.xcodeproj -target LucyRTL8125Ethernet -configuration Release -showBuildSettings | rg "^\s*(MACOSX_DEPLOYMENT_TARGET|SDKROOT|ARCHS|KERNEL_EXTENSION_HEADER_SEARCH_PATHS|KERNEL_FRAMEWORK_HEADERS|WRAPPER_EXTENSION)\s*="
 ```
 
-- 校验架构（当前工程为 `x86_64`）：
+- Az architektúra ellenőrzése — a jelenlegi projekt `x86_64`:
 
 ```bash
 lipo -info build/Release/LucyRTL8125Ethernet.kext/Contents/MacOS/LucyRTL8125Ethernet
 ```
 
-### 7.5 排查原则
+### 7.5 Hibaelhárítási alapelvek
 
-- 若 `xcodebuild -version` 与预期不一致，先修正 `xcode-select`。
-- 若命令行工具版本混乱，优先保证 Xcode 与 CLT 来自同一版本体系。
-- 若产物校验不满足预期，先检查是否误改了 `MACOSX_DEPLOYMENT_TARGET`、`SDKROOT`、`ARCHS`。
+- Ha az `xcodebuild -version` eredménye nem egyezik az elvárttal, először az `xcode-select` beállítását kell korrigálni.
+- Ha a parancssori eszközök verziói összevissza keverednek, elsődleges szempont legyen, hogy az Xcode és a CLT ugyanahhoz a verziórendszerhez tartozzon.
+- Ha a buildelt eredmény ellenőrzése nem felel meg az elvárásoknak, először ellenőrizd, hogy nem módosult-e véletlenül a `MACOSX_DEPLOYMENT_TARGET`, `SDKROOT` vagy `ARCHS`.
 
-### 7.6 环境搭建步骤（安装到可用）
+### 7.6 A környezet felépítése — a telepítéstől a működő buildig
 
-1. 按主机系统选择可用 Xcode 主版本：
-   - macOS 14：可用 Xcode 15.2/15.4（15.2 对应 14.2 SDK）。
-   - macOS 15：优先 Xcode 16.x。
+**1. A hostrendszer alapján válaszd ki a használható Xcode főverziót:**
 
-2. 下载并安装 Xcode：
-   - 从 [Apple Developer Downloads](https://developer.apple.com/download/all/) 下载对应 `.xip`。
-   - 解压后放到 `/Applications`（可命名为 `Xcode_16.x.app` 或 `Xcode_15.2.app` 便于并存）。
+- macOS 14: használható az Xcode 15.2/15.4 (a 15.2-höz 14.2 SDK tartozik).
+- macOS 15: elsődlegesen Xcode 16.x ajánlott.
 
-3. 切换命令行开发目录并接受许可：
+**2. Töltsd le és telepítsd az Xcode-ot:**
+
+- A megfelelő `.xip` fájlt az [Apple Developer Downloads](https://developer.apple.com/download/all/) oldalról lehet letölteni.
+- Kicsomagolás után helyezd az `/Applications` könyvtárba. Párhuzamos használat esetén például `Xcode_16.x.app` vagy `Xcode_15.2.app` névre is átnevezhető.
+
+**3. A parancssori fejlesztői könyvtár beállítása és a licenc elfogadása:**
 
 ```bash
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 sudo xcodebuild -license accept
 ```
 
-4. 安装或对齐 Command Line Tools（CLT）：
-   - 方式 A（推荐）：首次打开目标 Xcode，等待组件安装完成。
-   - 方式 B（手动）：安装对应版本 `Command Line Tools for Xcode` 安装包。
+**4. A Command Line Tools (CLT) telepítése vagy verziójának összehangolása:**
 
-5. 最终验证（必须通过）：
+- **A módszer — ajánlott:** első alkalommal indítsd el a célként használt Xcode-ot, majd várd meg, amíg a szükséges komponensek telepítése befejeződik.
+- **B módszer — manuális:** telepítsd a megfelelő verziójú `Command Line Tools for Xcode` csomagot.
+
+**5. Végső ellenőrzés — kötelezően sikeresnek kell lennie:**
 
 ```bash
 xcodebuild -version
@@ -146,4 +154,4 @@ xcode-select -p
 pkgutil --pkg-info=com.apple.pkg.CLTools_Executables
 ```
 
-6. 进入“标准构建步骤”执行编译与产物校验（见 7.3 与 7.4）。
+**6. Ezután hajtsd végre a „Standard buildlépések” folyamatot**, vagyis a fordítást és a buildelt eredmény ellenőrzését a 7.3 és 7.4 pont alapján.
